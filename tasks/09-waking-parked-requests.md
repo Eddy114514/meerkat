@@ -87,6 +87,19 @@ send the reply, or re-park on `EvalError::WaitOn(key)`). The `Box::pin` is
 required: `run_and_reply_or_park` and `wake_ready` are mutually recursive
 `async fn`s. Waiters are drained **oldest first**.
 
+**The drain must cover every path that can release a lock, not just parked
+runs.** `dispatch_network_events` serves a `LockRequest` inline, and
+`handle_lock_request` can release partial locks there — but that call happens
+outside `run_and_reply_or_park`, for instance while a non-transactional action
+is waiting on an outbound reply. Recording without a matching drain leaves the
+waiters asleep until some later parked dispatch happens to run, which on a node
+that then goes quiet is indefinitely.
+
+Apply the same two lines (`take_freed_awaiting_wake`, then `wake_ready` if
+non-empty) after **every** `dispatch_network_events` call in the server loop.
+Factor it into one shared helper rather than repeating it; there are several
+call sites and a missed one fails silently.
+
 ### 3. Do not wake a key twice
 
 `commit_participant` returns its freed keys in `ParticipantCommit::freed` and
@@ -95,7 +108,17 @@ the caller wakes them directly. Those keys must **not** also land in
 
 A key delivered twice is woken twice, and the second wake reaches the *next*
 waiter while the first one still holds the lock it was just given — wait-die
-then kills it. Deduplicate at the commit site.
+then kills it.
+
+**Abort has the identical shape and needs the same treatment.**
+`abort_participant` returns `HashSet<WaitKey>` (`manager/mod.rs:2141`, via
+`discard_failed_participant_txn`) and the server loop passes it straight to
+`wake_ready`, while the new recording inside `release_locks` queues those same
+keys. Deduplicate at both the commit and the abort site.
+
+Either discipline works — return the keys and suppress the queueing, or queue
+them and stop returning them — but pick one and apply it to both paths. Two
+sites disagreeing about which mechanism owns a key is how this bug comes back.
 
 ## Tests
 

@@ -75,6 +75,12 @@ Also:
 
 ## Notes
 
-- This fix is inert on its own: nothing retries a `WaitDieAbort` at the
-  originator until task 06. It lands first because it is small and independently
-  verifiable, and because 06's diff is easier to read without it mixed in.
+- This is useful on its own. `execute_action_with_txn` on `main` already
+  retries `EvalError::WaitDieAbort` while the budget lasts (see
+  `MAX_WAIT_DIE_RETRIES` and `txn_id.retry()`), so reconstructing the variant
+  is what makes **remote** contention retryable — that behaviour arrives with
+  this task, not with 06.
+- What task 06 adds on top is the other half of the rule: retrying on `WaitOn`,
+  translating an exhausted wait into something a user can read, and pacing the
+  attempts. This lands first because it is small and independently verifiable,
+  and because 06's diff is easier to read without it mixed in.

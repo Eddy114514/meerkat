@@ -43,9 +43,12 @@ The branch must be left intact as a read-only reference until task 12 merges.
 | 11 | [RYOW specification tests](11-ryow-specification-tests.md) | — | ~500 (tests only) |
 | 12 | [Compute on read](12-compute-on-read.md) | 02, 06, 10, 11 | large |
 
-**Tasks 01–05 are mutually independent** (except 04 on 03) and can be in review
-simultaneously. **Tasks 05–10 are serial**: each one hardens something that
-compute-on-read will stress, and several touch the same functions.
+**Tasks 01–03, 05 and 07 are mutually independent** and can be in review
+simultaneously; 04 needs 03. Beyond that there are two serial chains,
+**05 → 06** and **07 → 08 → 09 → 10**, which can run alongside each other.
+Within a chain the order is forced: each task hardens something the next one
+builds on, and several touch the same functions, so reviewing them together
+doubles the diff for no benefit.
 
 Task 11 is optional and can be done at any point; it only makes task 12's
 review easier by separating "what the semantics are" from "how they are
