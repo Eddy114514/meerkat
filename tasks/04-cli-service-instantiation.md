@@ -87,8 +87,10 @@ So fix the plumbing as part of this task:
   only because `run_server` had one slot for two different things, and it
   silently strips imports in exactly the configuration that needs them most.
 
-Only `Node::on_manager_startup` sets `manager.unified_ast` today
-(`node.rs:464`), which is why the test harnesses work and the server does not.
+`Node::on_manager_startup` (`node.rs:464`) and `run_client` both make this
+assignment; the `Manager` built inside `run_server` is the only one that never
+does. That is why the test harnesses and client mode work and the server does
+not.
 
 ### Startup order
 
@@ -100,9 +102,13 @@ Only `Node::on_manager_startup` sets `manager.unified_ast` today
    created.
 4. Create the program's own services from `prog`, in program order.
 
-`run_server` currently has no equivalent of step 3 at all — it iterates `&prog`
-twice, once to collect local names and once to create services. Adding it is
-part of this task, not a follow-up.
+`run_server` has no equivalent of step 3 at all, and no equivalent of step 1
+either. Its two `&prog` loops print service URLs and create services
+respectively; the `-i` registration between them is unconditional. So
+`local_service_names(&prog)` is new code in the server path, not a value
+already lying around to be reused — compute it before
+`register_remote_services`, or the collision guard silently does nothing there.
+Adding both is part of this task, not a follow-up.
 
 ## Tests
 
@@ -116,14 +122,24 @@ statements must not contribute names).
 
 Both are unit tests in `meerkat/src/main.rs` on the reference branch.
 
-**New — the server path needs its own coverage.** Both tests above exercise
-the registration helper, not startup, and the reference branch has nothing
-covering `run_server`'s instantiation. That is precisely the gap that let
-server mode ship with no import-instantiation step at all. Add a test that a
-program with a locally resolved import, started in server mode, ends up with
-the imported service in `manager.services` — and that it is still there when
-an unrelated `-i` flag is present, which is the configuration where the
-`target_ast` ternary used to strip the imports.
+**New — the server path needs its own coverage, and a seam to test through.**
+Both tests above exercise the registration helper, not startup, and the
+reference branch has nothing covering `run_server`'s instantiation. That is
+precisely the gap that let server mode ship with no import-instantiation step
+at all.
+
+`run_server` cannot be asserted against as it stands: it builds its `Manager`
+locally, returns `Result<(), Box<dyn Error>>`, and then runs the event loop
+forever. Extract the startup half into a helper that **returns the initialised
+`Manager`** — everything from `Manager::new` through step 4, stopping before
+the loop — and have `run_server` call it. That is a worthwhile change on its
+own: it puts server and client startup on the same shape and makes the ordering
+in steps 1-4 something a test can see.
+
+Then assert that a program with a locally resolved import ends up with the
+imported service in `manager.services`, **and** that it is still there when an
+unrelated `-i` flag is present — the configuration where the `target_ast`
+ternary used to strip the imports.
 
 ## Notes
 

@@ -168,8 +168,20 @@ On a successful `ActionResponse`, in `remote_action`:
    Fall back to recording the slug actually dispatched to, as
    `record_touched_services` does on the reference branch. Reading empty as
    "nothing was touched" turns a version skew into silent staleness.
-3. **Invalidate**: drop from `txn.read_cache` every entry owned by a touched
-   service, and every memoised def whose `graphs.cross_deps` name one.
+3. **Invalidate**, in two steps. First find the *directly* affected entries:
+   everything in `txn.read_cache` owned by a touched service, plus every
+   memoised def whose `graphs.cross_deps` name one. Then **run §3a's listener
+   walk from each of them**, so anything derived from a directly affected def
+   is dropped too.
+
+   The second step is not optional. `graphs.cross_deps` records only a def's
+   *own* cross-service dependencies, so with `def y = remote.x` and
+   `def z = y + 1`, `z` has no cross-service dep at all. Stopping at the direct
+   set drops `y` and leaves a stale `z` for the rest of the transaction.
+
+   This is the same primitive as §3a with a different seed set: §3a seeds from
+   a written member, §3b seeds from the directly affected defs. Implement
+   invalidation once and call it from both.
 
 **Never evict an entry that is also in `txn.written`.** Those are this
 transaction's own buffered writes, mirrored into `read_cache` by `assign`; they
@@ -245,7 +257,10 @@ naming will otherwise invite someone to restore the symmetry.
    transaction, issues one remote lookup.
 6. **New — invalidation on a composed action:** the same def, read before and
    after a composed action that writes its remote dependency, returns the
-   updated value on the second read. This is the test for §3b.
+   updated value on the second read. This is the test for §3b. Include the
+   transitive form (`def y = remote.x`, `def z = y + 1`, read `z` first):
+   `z` has no cross-service dep of its own, so it passes only if §3b runs the
+   listener walk rather than stopping at the directly affected defs.
 7. **New — a composed action does not evict this transaction's own writes.**
    Write a local member, compose an action, then read that member back; it must
    still be the buffered value. Covers the `txn.written` guard in §3b.

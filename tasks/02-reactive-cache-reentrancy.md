@@ -121,3 +121,20 @@ unreachable peer at that exact instant from `.mkt` is no easier.)
 - Extend the doc comment to explain *why* it is a save/restore and not a clear.
   The reference branch's comment is good; reuse it. Without the explanation this
   reads like a pointless complication and will be "simplified" back into a bug.
+- **The restore is not cancellation-safe, and that is accepted here.** It runs
+  after the `await`, so it is reached on the error path (the timeout inside
+  `send_and_await_reply` returns `Err`, it does not drop the caller) but not if
+  the enclosing `recompute_def` future is itself dropped. A `Drop` guard is the
+  textbook fix and does not fit: `eval` takes `&mut EvalContext { manager: self,
+  .. }`, so `self` is mutably borrowed across the whole evaluation and a guard
+  holding `self.reactive_cache` cannot coexist with it. Making it safe means
+  moving the cache out of `Manager` or behind interior mutability, which is a
+  larger change than this task.
+
+  It is unreachable today: the only `select!` in production code is the timeout
+  inside `send_and_await_reply` (`manager/mod.rs:1212` and `:1266`), and nothing
+  wraps a propagation in `select!`, `timeout()` or an abortable task. Record
+  this as a constraint in the doc comment — **anything that later wraps
+  propagation in a cancellation point must deal with the cache first**, or a
+  dropped recompute leaves a stale map installed and a later `MemberAccess`
+  serves from it without ever reaching `lookup`.
