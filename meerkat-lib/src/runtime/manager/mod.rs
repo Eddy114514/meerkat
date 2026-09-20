@@ -736,6 +736,22 @@ impl Manager {
             .cloned()
             .unwrap_or_default();
 
+        // Save and restore rather than clear. Evaluation can await a remote
+        // read, and while it waits `send_and_await_reply` pumps network events,
+        // so an incoming `Update` can re-enter this function through
+        // `handle_update`. Clearing on the way out would drop the cache that an
+        // outer, suspended recompute is relying on, and it would resume
+        // resolving member accesses against whatever state exists at that
+        // moment rather than the dependency snapshot it started with. Restoring
+        // the previous value keeps the caches properly nested.
+        //
+        // The restore is deliberately not cancellation-safe: it runs after the
+        // await, so it is reached on the error path but not if this future is
+        // dropped. Nothing wraps a propagation in `select!`, `timeout()` or an
+        // abortable task today. Anything that starts doing so has to deal with
+        // this cache first, or a dropped recompute leaves a stale map installed
+        // and a later `MemberAccess` serves from it without reaching `lookup`.
+        let outer_cache = self.reactive_cache.take();
         self.reactive_cache = Some(cache);
         let result = eval(
             &expr,
@@ -747,10 +763,7 @@ impl Manager {
             },
         )
         .await;
-        // The reactive cache is only valid for the single recompute above (its
-        // entries are this def's cached cross-service deps), so clear it before
-        // returning to avoid leaking stale entries into later evaluations.
-        self.reactive_cache = None;
+        self.reactive_cache = outer_cache;
 
         let value = match result {
             Ok(v) => v,
@@ -2917,6 +2930,56 @@ mod tests {
         tc.manager.create_service(tc.foo, decls).await.unwrap();
         let result = tc.manager.lookup(tc.f, tc.foo, None).await.unwrap();
         assert_eq!(result, Value::Int { val: 5 });
+    }
+
+    /// Recomputing a def must restore whatever reactive cache was already
+    /// active, not clear it.
+    ///
+    /// Evaluation can await a remote read, and `send_and_await_reply` pumps
+    /// network events while it waits, so an inbound `Update` re-enters
+    /// `recompute_def` through `handle_update` in the middle of an outer
+    /// recompute. Clearing the cache on the way out would leave the suspended
+    /// outer evaluation resolving member accesses against nothing.
+    #[tokio::test]
+    async fn test_recompute_def_restores_an_active_reactive_cache() {
+        let mut tc = TestContext::new();
+        let decls = vec![
+            Decl::VarDecl {
+                name: tc.x,
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 2 },
+                },
+            },
+            Decl::DefDecl {
+                name: tc.y,
+                ty: None,
+                val: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr2: Box::new(Expr::Literal {
+                        val: Value::Int { val: 1 },
+                    }),
+                },
+                is_pub: true,
+            },
+        ];
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+
+        // Stand in for an outer recompute suspended at an await with its own
+        // cross-service deps installed.
+        let outer: HashMap<(Symbol, Symbol), Value> = [((tc.s1, tc.w), Value::Int { val: 7 })]
+            .into_iter()
+            .collect();
+        tc.manager.reactive_cache = Some(outer.clone());
+
+        tc.manager.recompute_def(tc.foo, tc.y).await;
+
+        assert_eq!(
+            tc.manager.reactive_cache,
+            Some(outer),
+            "a nested recompute must hand the outer cache back untouched"
+        );
     }
 
     #[tokio::test]
