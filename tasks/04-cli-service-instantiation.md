@@ -58,7 +58,39 @@ fn register_remote_services(
 
 Both `run_server` and `run_client` must call it. Neither may keep its own loop.
 
-Then, in startup order:
+### `run_server` needs the unified AST first
+
+The sequence below walks `manager.unified_ast`, and **in server mode that field
+is never populated**. `run_client(full_ast, prog, ...)` takes both ASTs and
+assigns `manager.unified_ast = full_ast` (`main.rs:997-1011`); `run_server(prog,
+...)` takes a single `Vec<Stmt>`, constructs `Manager::new(interner)`, and never
+assigns it. Step 3 would have nothing to walk and local imports would stay
+uninstantiated.
+
+Worse, the caller already discards the imports before `run_server` sees them:
+
+```rust
+let target_ast = if remote_url_map.is_empty() {
+    node.unified_ast.clone()   // imports included
+} else {
+    prog                       // imports dropped whenever -i is used
+};
+```
+
+So fix the plumbing as part of this task:
+
+- Give `run_server` the same shape as `run_client`: take `full_ast` **and**
+  `prog` as separate parameters, and assign `manager.unified_ast = full_ast`
+  immediately after constructing the `Manager`.
+- Delete the `target_ast` ternary at the call site and pass
+  `node.unified_ast.clone()` and `prog` unconditionally. The ternary exists
+  only because `run_server` had one slot for two different things, and it
+  silently strips imports in exactly the configuration that needs them most.
+
+Only `Node::on_manager_startup` sets `manager.unified_ast` today
+(`node.rs:464`), which is why the test harnesses work and the server does not.
+
+### Startup order
 
 1. Compute `local_service_names(&prog)`.
 2. `register_remote_services(...)` — **before any import is processed**.
@@ -67,6 +99,10 @@ Then, in startup order:
    `local_service_names` nor in `manager.remote_services`, skipping any already
    created.
 4. Create the program's own services from `prog`, in program order.
+
+`run_server` currently has no equivalent of step 3 at all — it iterates `&prog`
+twice, once to collect local names and once to create services. Adding it is
+part of this task, not a follow-up.
 
 ## Tests
 
@@ -79,6 +115,15 @@ Also: `local_service_names_covers_declarations_only` (non-`Stmt::Service`
 statements must not contribute names).
 
 Both are unit tests in `meerkat/src/main.rs` on the reference branch.
+
+**New — the server path needs its own coverage.** Both tests above exercise
+the registration helper, not startup, and the reference branch has nothing
+covering `run_server`'s instantiation. That is precisely the gap that let
+server mode ship with no import-instantiation step at all. Add a test that a
+program with a locally resolved import, started in server mode, ends up with
+the imported service in `manager.services` — and that it is still there when
+an unrelated `-i` flag is present, which is the configuration where the
+`target_ast` ternary used to strip the imports.
 
 ## Notes
 

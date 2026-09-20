@@ -87,38 +87,59 @@ send the reply, or re-park on `EvalError::WaitOn(key)`). The `Box::pin` is
 required: `run_and_reply_or_park` and `wake_ready` are mutually recursive
 `async fn`s. Waiters are drained **oldest first**.
 
-**The drain must cover every path that can release a lock, not just parked
-runs.** `dispatch_network_events` serves a `LockRequest` inline, and
-`handle_lock_request` can release partial locks there — but that call happens
-outside `run_and_reply_or_park`, for instance while a non-transactional action
-is waiting on an outbound reply. Recording without a matching drain leaves the
-waiters asleep until some later parked dispatch happens to run, which on a node
-that then goes quiet is indefinitely.
+**The drain must also cover releases that happen with no dispatcher present.**
+`Manager::send_and_await_reply` pumps `dispatch_network_events` while this node
+waits on an outbound reply, and that pump can serve an inbound `LockRequest`
+inline; `handle_lock_request` may release partial locks there. Nothing on that
+path can hand the freed keys anywhere — it is running underneath an unrelated
+outbound call.
 
-Apply the same two lines (`take_freed_awaiting_wake`, then `wake_ready` if
-non-empty) after **every** `dispatch_network_events` call in the server loop.
-Factor it into one shared helper rather than repeating it; there are several
-call sites and a missed one fails silently.
+Note that the server loop itself never calls `dispatch_network_events`; it
+handles inbound events directly, and the pump lives only inside
+`send_and_await_reply` (`manager/mod.rs:1211` and `:1252`). So there is no
+"after the dispatch call" hook to attach to in `main.rs`.
+
+Instead, **sweep at the top of every server-loop iteration**, before any other
+work:
+
+```rust
+loop {
+    let freed = manager.take_freed_awaiting_wake();
+    if !freed.is_empty() {
+        wake_ready(&mut manager, freed).await;
+    }
+    // ... pending updates, then the inbound-event match
+}
+```
+
+This catches anything released underneath an outbound call on the previous
+iteration, and it is one site rather than a list of call sites that must be
+kept in sync.
 
 ### 3. Do not wake a key twice
 
-`commit_participant` returns its freed keys in `ParticipantCommit::freed` and
-the caller wakes them directly. Those keys must **not** also land in
-`freed_awaiting_wake`.
+Two paths already hand freed keys back to their caller, and once
+`release_locks` queues them as well, each key is delivered twice. The failure
+is not a lost wake but a spurious one: the second wake reaches the *next*
+waiter while the first one still holds the lock it was just given, and wait-die
+kills it.
 
-A key delivered twice is woken twice, and the second wake reaches the *next*
-waiter while the first one still holds the lock it was just given — wait-die
-then kills it.
+`commit_participant` returns its keys in `ParticipantCommit::freed` (task 08)
+and the caller wakes them directly. `abort_participant` returns
+`HashSet<WaitKey>` (`manager/mod.rs:2141`, via
+`discard_failed_participant_txn`) and on `main` the server loop passes that
+straight to `wake_ready` too.
 
-**Abort has the identical shape and needs the same treatment.**
-`abort_participant` returns `HashSet<WaitKey>` (`manager/mod.rs:2141`, via
-`discard_failed_participant_txn`) and the server loop passes it straight to
-`wake_ready`, while the new recording inside `release_locks` queues those same
-keys. Deduplicate at both the commit and the abort site.
+Give each key exactly one owner, resolving the two paths differently because
+they sit differently:
 
-Either discipline works — return the keys and suppress the queueing, or queue
-them and stop returning them — but pick one and apply it to both paths. Two
-sites disagreeing about which mechanism owns a key is how this bug comes back.
+- **Abort: use the queue.** Discard `abort_participant`'s return value and wake
+  from `take_freed_awaiting_wake()` instead. The abort arm has no reason to
+  care which keys came from where, and §2's loop-head sweep would catch them
+  on the next iteration regardless.
+- **Commit: use the return value.** `commit_participant` has to report its
+  freed keys upward anyway, and its caller wakes them on the spot, so suppress
+  the queueing for those keys at the commit site.
 
 ## Tests
 

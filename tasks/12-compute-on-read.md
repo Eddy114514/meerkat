@@ -47,9 +47,18 @@ currently tell them apart.
 
 Inside a transaction, when the member is a def (`service.defs.contains_key`):
 
-1. Serve from `txn.read_cache` if present (see §3a and §3b on what
+1. **Take the read lock on the def member itself**, exactly as the current code
+   does before returning a stored value — `(service_net_id, name)` recorded in
+   `txn.locked`. Do not drop this step on the grounds that §2 locks the
+   dependencies: an `update` transaction write-locks **defs as well as vars**
+   (`runtime/update.rs:141-147` puts both `Decl::VarDecl` and `Decl::DefDecl`
+   into the lock group's write set), so without it a concurrent update can
+   replace the def's *expression* while this transaction is evaluating and
+   memoising it. Locking dependencies protects the inputs; this protects the
+   definition.
+2. Serve from `txn.read_cache` if present (see §3a and §3b on what
    invalidates it).
-2. Otherwise recompute it (§2), insert the result into `txn.read_cache`, and
+3. Otherwise recompute it (§2), insert the result into `txn.read_cache`, and
    return it.
 
 Outside a transaction, behaviour is unchanged: return the stored value.
