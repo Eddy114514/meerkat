@@ -29,13 +29,15 @@ it reads, failing with `ServiceNotFound`.
 `remote_services` **first**, before anything local. So `-i s2=/ip4/.../p2p/...`
 against a program that itself declares `service s2` routes that service's reads
 and writes to a peer and leaves the locally declared copy permanently
-unreachable — silently. This is almost always a typo on the command line. Both
-`run_server` and `run_client` had their own copy of the registration loop and
-both had the defect.
+unreachable — silently. This is almost always a typo on the command line.
+`run_server`, `run_client` and `Node::on_manager_startup`
+(`meerkat-lib/src/runtime/node.rs:467-473`) each had their own copy of the
+registration loop, and all three had the defect.
 
 ## Specification
 
-Add two free functions in `meerkat/src/main.rs`:
+Add two functions, in `meerkat-lib` beside `Manager` (see below for why not in
+`meerkat/src/main.rs`):
 
 ```rust
 /// The names of the services this program declares itself.
@@ -56,7 +58,15 @@ fn register_remote_services(
   the flag had no effect;
 - otherwise insert into `manager.remote_services` and report the registration.
 
-Both `run_server` and `run_client` must call it. Neither may keep its own loop.
+All three registration sites must call it — `run_server`, `run_client` and
+`Node::on_manager_startup` — and none may keep its own loop.
+`on_manager_startup` is in `meerkat-lib` and cannot call into the binary, so the
+two functions belong there (on `Manager`, or beside it), with `main.rs` calling
+them. A copy in `main.rs` alone leaves defect (iii) alive on the third path,
+which is the one the test harnesses use. `on_manager_startup` must compute its
+local set from its `local_ast` parameter, **not** from `self.unified_ast`: the
+unified AST also contains the resolved bodies of imported services, so a local
+set taken from it would skip every `-i` flag.
 
 ### `run_server` needs the unified AST first
 
@@ -118,12 +128,16 @@ Adding both is part of this task, not a follow-up.
 `lookup` of an `s2` member routes to the peer.
 
 Also: `local_service_names_covers_declarations_only` (non-`Stmt::Service`
-statements must not contribute names).
+statements must not contribute names), and
+`on_manager_startup_skips_locally_declared_services` — the same assertion
+through `Node::on_manager_startup`, which is the third path and the one that
+is not covered by either test above.
 
-Both are unit tests in `meerkat/src/main.rs` on the reference branch.
+The first two are unit tests on the reference branch (there against the
+`main.rs` copies of the helpers; they move with them).
 
 **New — the server path needs its own coverage, and a seam to test through.**
-Both tests above exercise the registration helper, not startup, and the
+The tests above exercise the registration helper, not startup, and the
 reference branch has nothing covering `run_server`'s instantiation. That is
 precisely the gap that let server mode ship with no import-instantiation step
 at all.

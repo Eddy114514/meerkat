@@ -46,7 +46,12 @@ fn remote_error(err: String) -> EvalError {
 ```
 
 Route every site that reconstructs an `EvalError` from a remote `error` string
-through it.
+through it: `manager/mod.rs:1502`, `:1640`, `:2493` and — the one that matters —
+the `LockResponse` arm at `:2445-2450`, which is the path a remote wait-die
+actually travels. Both anti-patterns below already live there on `main`: it
+matches with `err_str.contains("Wait-die abort")` and rebuilds
+`WaitDieAbort(err_str)` with the prefix still attached. Delete that code rather
+than extending it.
 
 Two properties are load-bearing and must not be "simplified":
 

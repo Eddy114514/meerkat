@@ -95,9 +95,12 @@ path can hand the freed keys anywhere — it is running underneath an unrelated
 outbound call.
 
 Note that the server loop itself never calls `dispatch_network_events`; it
-handles inbound events directly, and the pump lives only inside
-`send_and_await_reply` (`manager/mod.rs:1211` and `:1252`). So there is no
-"after the dispatch call" hook to attach to in `main.rs`.
+handles inbound events directly, and within the CLI the pump is reached only
+from `send_and_await_reply` (`manager/mod.rs:1211` and `:1252`). So there is no
+"after the dispatch call" hook to attach to in `main.rs`. (The wasm render loop
+pumps as well — `meerkat-wasm/src/lib.rs:270` — but nothing parks there:
+`park_request_key` is called only from `main.rs`. A wasm build that ever parks
+needs the same sweep at the top of that loop.)
 
 Instead, **sweep at the top of every server-loop iteration**, before any other
 work:

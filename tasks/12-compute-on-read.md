@@ -168,11 +168,21 @@ On a successful `ActionResponse`, in `remote_action`:
    Fall back to recording the slug actually dispatched to, as
    `record_touched_services` does on the reference branch. Reading empty as
    "nothing was touched" turns a version skew into silent staleness.
-3. **Invalidate**, in two steps. First find the *directly* affected entries:
-   everything in `txn.read_cache` owned by a touched service, plus every
-   memoised def whose `graphs.cross_deps` name one. Then **run §3a's listener
-   walk from each of them**, so anything derived from a directly affected def
-   is dropped too.
+3. **Invalidate**, in two steps. First fix what "owned by a touched service"
+   means, because the three names involved are not the same name: a reported
+   entry is the *owner node's own* service name, `txn.read_cache` is keyed by
+   `(ServiceNetId, Symbol)`, and `graphs.cross_deps` is keyed by in-scope local
+   name. Match on the **slug** — `split_service_net_id(sid).1` for a cache key,
+   and the same applied to `service_net_id_for_name(owner)` for a cross-dep.
+   Comparing interned local names instead silently never fires under an import
+   alias, which is exactly the staleness §3b exists to close. Slug matching can
+   over-invalidate when two nodes each declare a service of that name; that
+   costs a recompute and is the safe direction.
+
+   Then find the *directly* affected entries: everything in `txn.read_cache`
+   owned by a touched service, plus every memoised def whose `graphs.cross_deps`
+   name one. Then **run §3a's listener walk from each of them**, so anything
+   derived from a directly affected def is dropped too.
 
    The second step is not optional. `graphs.cross_deps` records only a def's
    *own* cross-service dependencies, so with `def y = remote.x` and
@@ -226,7 +236,8 @@ This is a new failure mode, not a ported one; give it its own test.
 - `propagate_in_txn`
 - `refresh_remote_cross_deps_in_txn`
 - the `propagate_in_txn` call in `assign` — `assign` buffers the write into
-  `txn.written` and `txn.read_cache` and does nothing else
+  `txn.written` and `txn.read_cache`, then runs §3a's invalidation walk, and
+  nothing more. No recompute, no lock, no network read happens in `assign`
 - `txn.remote_writes` **as a recompute trigger**. It survives, populated and
   consumed as described in §3b, but only to drive invalidation and transitive
   reporting — never to decide what to recompute.

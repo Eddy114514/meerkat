@@ -69,7 +69,9 @@ pub composed_seq: u64,
 
 In `remote_action`, **after** the existing `participants.insert`
 pre-registration, claim the next position and short-circuit if it is already
-recorded:
+recorded. That pre-registration currently *moves* the parameter
+(`if let Some(t) = txn` at `manager/mod.rs:1594`); reborrow it as
+`txn.as_deref_mut()` there, or nothing below compiles:
 
 ```rust
 let replay = match txn.as_deref_mut() {

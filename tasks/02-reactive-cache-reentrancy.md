@@ -93,10 +93,17 @@ Assert either way round:
 
 Recorded so this does not get re-derived. The trigger needs an inbound `Update`
 to land inside the await window of an outer recompute's remote read. That
-window is narrow but not rare: `dispatch_network_events` is called only from
-inside `send_and_await_reply` (`manager/mod.rs:1211` and `:1252`), so a node
-handles inbound messages *only* while waiting on an outbound call, which is
-exactly when an outer recompute is suspended.
+The window is narrow but not rare. What it needs is the message pump running
+*underneath* a suspended recompute, and only one pump nests that way: the one
+inside `send_and_await_reply` (`manager/mod.rs:1211` and `:1252`), which is
+reached exactly when an outer recompute awaits a remote read.
+
+The other two pumps cannot nest, which is why they are not a second route in.
+The CLI server loop handles `Update` itself, at the top of the loop
+(`main.rs:922-940`) — no recompute is suspended above it, so the inner
+`recompute_def` there is simply the outermost one. The wasm render loop pumps on
+a timer (`meerkat-wasm/src/lib.rs:270`) and is likewise top-level, and `.mkt`
+does not run there at all.
 
 `.mkt` gives no lever to sequence that -- no sleep, no barrier, no control over
 when a peer sends -- so such a test would be waiting on luck and a failure
@@ -131,10 +138,12 @@ unreachable peer at that exact instant from `.mkt` is no easier.)
   moving the cache out of `Manager` or behind interior mutability, which is a
   larger change than this task.
 
-  It is unreachable today: the only `select!` in production code is the timeout
-  inside `send_and_await_reply` (`manager/mod.rs:1212` and `:1266`), and nothing
-  wraps a propagation in `select!`, `timeout()` or an abortable task. Record
-  this as a constraint in the doc comment — **anything that later wraps
-  propagation in a cancellation point must deal with the cache first**, or a
-  dropped recompute leaves a stale map installed and a later `MemberAccess`
-  serves from it without ever reaching `lookup`.
+  It is unreachable today: production code has two `select!`s — the timeout
+  inside `send_and_await_reply` (`manager/mod.rs:1212` and `:1266`), which
+  returns `Err` rather than dropping its caller, and the network actor's event
+  loop (`net/actor.rs:307`), which polls swarm and channel futures and never a
+  recompute — and nothing wraps a propagation in `select!`, `timeout()` or an
+  abortable task. Record this as a constraint in the doc comment — **anything
+  that later wraps propagation in a cancellation point must deal with the cache
+  first**, or a dropped recompute leaves a stale map installed and a later
+  `MemberAccess` serves from it without ever reaching `lookup`.

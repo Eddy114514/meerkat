@@ -75,9 +75,19 @@ natively, `gloo_timers::future::TimeoutFuture` wrapped in `send_wrapper::SendWra
 on `wasm32` (wasm has no tokio timer driver in the browser, and the eval path is
 `Send`-bounded).
 
-Document the limit honestly: this is a yield point, not a fix for the case where
-the only thing that could release the lock is a message this node cannot receive
-while inside the retry loop. That needs the background message loop of #28.
+Pace the two outcomes differently. A **die** wants to re-run promptly, so 2ms
+is right for it. A **wait** must give the holder time to commit, so give
+`WaitOn` its own `WAIT_ON_RETRY_BACKOFF_MS` (20ms).
+
+Document the limit honestly, because the shape of §1 has a consequence worth
+naming: `MAX_WAIT_DIE_RETRIES` (10) doubles as the originator's wait
+**timeout**. An older transaction — one wait-die guarantees should win — is
+killed after roughly 200ms of contention, or 20ms if both outcomes share the 2ms
+backoff. That bound is inherent to retrying instead of parking, not a tuning
+accident; say so where the constant is defined. And this is a yield point, not a
+fix for the case where the only thing that could release the lock is a message
+this node cannot receive while inside the retry loop. Both need the background
+message loop of #28.
 
 ## Tests
 

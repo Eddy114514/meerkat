@@ -9,13 +9,12 @@ rewritten `commit_participant` (~line 2768), and
 
 ## Rationale
 
-The **originator** already commits in the right order: store its own writes,
-send `Commit` to every participant, and only then recompute what is derived from
-those writes.
-
-A node in the **middle** of a chain did not. `commit_participant` called
-`apply_committed_writes`, which stores *and* propagates in one step, before
-forwarding `Commit` to the nodes below it.
+**Neither commit path commits downward before propagating.** The originator
+(`execute_action_with_txn`, `manager/mod.rs:2009-2013`) calls
+`apply_committed_writes` — which stores *and* propagates in one step — and only
+then sends `Commit` to its participants. `commit_participant` does the same
+before forwarding `Commit` to the nodes below it. Any node with both
+participants and a local def over them is affected, originator included.
 
 Concretely, with `client -> mid -> rc` and `def mid_view = mv + rc.gc`: on
 `Commit`, `mid` stores `mv`, then immediately recomputes `mid_view` — reading
@@ -65,7 +64,7 @@ the comment explaining this.
 
 ## Tests
 
-**Illustrating test** (and the only one):
+**Illustrating test:**
 `test_participant_commits_sub_participants_before_propagating` in
 `meerkat-lib/tests/participant_commit_order_test.rs`.
 
@@ -73,6 +72,11 @@ It stands in for `rc` with a bare network peer rather than a real `Manager`, so
 the peer can record exactly when it receives `Commit` relative to the read that
 `mid`'s propagation issues. That makes the ordering directly observable instead
 of timing-dependent — preserve this construction if you rewrite the test.
+
+**New — the originator path.** The reference branch covers only the participant,
+so the same defect in `execute_action_with_txn` would survive both. Add the
+mirror test, same stand-in-peer construction, with an originating action in
+place of the forwarded `Commit`.
 
 ## Notes
 
