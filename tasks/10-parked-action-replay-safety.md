@@ -50,12 +50,17 @@ first's writes.
 In `runtime/txn.rs`:
 
 ```rust
-/// A composed action that completed under a transaction: where it was sent.
+/// A composed action that completed under a transaction: where it was sent,
+/// and what was sent, so a diverging replay is detected rather than suppressed.
 #[derive(Debug, Clone)]
 pub struct ComposedCall {
     pub target: ServiceNetId,
+    pub fingerprint: u64,
 }
 ```
+
+`fingerprint` hashes the encoded `stmts` and `env` — the same values the
+dispatch ships — so it costs one pass over data already being serialised.
 
 and on `Transaction`:
 
@@ -83,7 +88,9 @@ let replay = match txn.as_deref_mut() {
     _ => None,
 };
 if let Some((seq, done)) = replay {
-    if &done.target != service_net_id {
+    let same = &done.target == service_net_id
+        && done.fingerprint == fingerprint(&stmts, &env);
+    if !same {
         return Err(EvalError::LocalDispatchFailed(format!(
             "replayed transaction dispatched a different composed action at \
              position {}: recorded '{}', now '{}'",
@@ -105,10 +112,19 @@ Three properties this shape gives you, all of which are tested:
 - A dispatch occurring **after** a successful run claims a fresh position, so
   two genuinely distinct composed actions stay distinct. This must not become
   "suppress any dispatch to a target we have already contacted".
-- The target check fails the transaction rather than guessing. A record whose
-  target does not match the dispatch reaching its position means the replay took
-  a different branch, and silently substituting the recorded result would be
-  wrong.
+- The identity check fails the transaction rather than guessing, and **target
+  alone is not identity**. A replay that branches into a *different* action on
+  the same service matches on target, is suppressed, and commits the first run's
+  buffered effect while the action the surviving run asked for never runs at
+  all. Comparing the fingerprint too turns that into an abort. That is the
+  intended trade: the effect already buffered downstream cannot be rolled back
+  from here, so failing is the only honest outcome.
+- **Every recorded position must be claimed.** A replay that branches *past* a
+  `do` the first attempt made never reaches that position, so no check fires —
+  and the transaction commits an effect the surviving run never asked for. After
+  a participant run completes, `composed_seq` must equal `composed_done.len()`;
+  if it is smaller, fail the transaction for the same reason. Positions are
+  dense, so this is one comparison.
 - Recording happens **before** anything fallible that follows the response. On
   the reference branch that mattered because a cross-service refresh ran there
   and could itself park. That refresh does not exist in this task, but keep the
@@ -132,6 +148,9 @@ Also:
 - `test_a_parked_action_replays_every_composed_action_it_completed`
 - `test_a_second_composed_action_under_the_same_transaction_still_dispatches`
   (guards against over-suppression — it must fail if you suppress by target)
+- `test_a_replay_that_dispatches_a_different_action_to_the_same_target_fails`
+  and `test_a_replay_that_skips_a_recorded_dispatch_fails` — the two divergence
+  checks above; both pass trivially if the guard is target-only
 - `test_parked_participant_run_rolls_back_what_it_buffered` (half (a))
 - `test_second_action_under_one_txn_keeps_the_first_write` (why (a) restores
   rather than clears)

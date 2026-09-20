@@ -145,6 +145,10 @@ following listeners into other services on this node.
 That is exactly what `touched_services` reports, so bring that plumbing back —
 repurposed from "recompute these defs now" to "invalidate these cached reads":
 
+- `Transaction.remote_writes: HashSet<Symbol>` — a **new** field. `main`'s
+  `Transaction` (`runtime/txn.rs:248-265`) does not have it; add it and
+  initialise it empty in `Transaction::new`. Everything below reads or writes
+  it.
 - `ActionResponse.touched_services: Vec<String>` in `meerkat-lib/src/net/types.rs`,
   with `#[serde(default)]` so older peers still decode.
 - `codec::validate_touched_services(&[String]) -> Result<()>`.
@@ -155,6 +159,13 @@ repurposed from "recompute these defs now" to "invalidate these cached reads":
 - `ComposedCall` (task 10) gains `touched_services`, so a **replayed** dispatch
   reports the same set as the original. A replay that reported a narrower set
   would invalidate less and serve a stale value.
+- The **producer**. Nothing on `main` fills the field, and it is easy to ship
+  the whole consumer side without noticing: the participant's `ActionRequest`
+  reply in `meerkat/src/main.rs` must call `touched_services_for_txn(&tid)` on
+  success — while the transaction is still in `pending_txns` — and send the
+  result; the failure replies send an empty vec. An unfilled field is
+  indistinguishable from version skew, which is the whole reason step 2 below
+  treats empty as "unknown" rather than "nothing".
 
 On a successful `ActionResponse`, in `remote_action`:
 
@@ -210,6 +221,40 @@ run produced.
 Record the `ComposedCall` **before** the invalidation runs. The invalidation
 path can read, and therefore can park, *inside* the `do` statement — which is
 precisely the case deferred from task 10.
+
+#### 3c. A participant invalidates on its own requests
+
+§3a and §3b both run on the node that writes or composes, and neither can reach
+a **participant's** `pending_txns[tid].read_cache`. That cache has the mirror
+problem: with `def b.y = a.x` on B and the transaction originating at A, A reads
+`b.y`, writes `x`, reads `b.y` again — and B serves the `y` it memoised from the
+pre-write `x`.
+
+A participant can only act on the one event it sees, so: **when a request
+arrives under a transaction id already in `pending_txns`, invalidate before
+running it.** At the top of `execute_action_participant` and
+`remote_read_participant`, in the branch where the transaction came out of the
+map rather than being freshly created, seed §3a's walk with every memoised def
+whose `graphs.cross_deps` are non-empty. Locally derived defs stay: their inputs
+are on this node, read-locked by this transaction, and this node's own writes
+already invalidate through §3a.
+
+That is sufficient whenever the writer is another *participant* — its buffered
+write is in its own `pending_txns` entry and the forced re-read finds it.
+
+⚠️ **It is not sufficient when the writer is the originator, and that case is
+out of contract.** The forced re-read of `a.x` arrives at A's
+`remote_read_participant`, which builds a **fresh** `Transaction`: the
+originator's live one is a local in `execute_action_with_txn`
+(`manager/mod.rs:1981`) and never enters `pending_txns`, so the read-back sees
+pre-transaction state and returns the same stale value. Do not paper over it —
+track the originator's in-flight ids (`Manager::active_txns: HashSet<TxnId>`)
+and have `remote_read_participant` return an `EvalError` naming the transaction
+when a read arrives for one, so this fails loudly instead of silently reading
+around the buffered writes. Making it work means the originator's transaction
+becoming addressable while it runs, which is #28's event-loop work. Record the
+boundary in `meerkat/tests/README.md` next to task 11's scenarios: a def on the
+originator over a remote var is in contract; the inverse is not yet.
 
 ### 4. Cycle detection
 
@@ -277,8 +322,14 @@ naming will otherwise invite someone to restore the symmetry.
    still be the buffered value. Covers the `txn.written` guard in §3b.
 8. **New — transitive touched-services reporting.** In a `client -> mid -> rc`
    chain where only `rc` is written, a `client` def over `rc` must see the new
-   value. Fails if §3b's merge into `txn.remote_writes` is missing.
-9. `meerkat/tests/s1.mkt` passes.
+   value. Fails if §3b's merge into `txn.remote_writes` is missing — or if the
+   participant reply never fills the field.
+9. **New — §3c, both halves.** A participant's def over a *second participant's*
+   var, read before and after a composed action that writes it, sees the new
+   value. And a participant's def over the **originator's** var, read after the
+   originator writes it, fails with the named error rather than returning the
+   stale value.
+10. `meerkat/tests/s1.mkt` passes.
 
 ## Notes
 
