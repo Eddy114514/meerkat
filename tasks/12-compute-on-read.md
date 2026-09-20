@@ -149,23 +149,26 @@ repurposed from "recompute these defs now" to "invalidate these cached reads":
   `Transaction` (`runtime/txn.rs:248-265`) does not have it; add it and
   initialise it empty in `Transaction::new`. Everything below reads or writes
   it.
-- `ActionResponse.touched_services: Vec<String>` in `meerkat-lib/src/net/types.rs`,
-  with `#[serde(default)]` so older peers still decode.
+- `ActionResponse.touched_services: Option<Vec<String>>` in
+  `meerkat-lib/src/net/types.rs`, with `#[serde(default)]` so older peers still
+  decode — as `None`, which step 2 treats differently from `Some(vec![])`.
 - `codec::validate_touched_services(&[String]) -> Result<()>`.
 - `Manager::touched_services_for_txn(&TxnId) -> Vec<String>` — the **transitive**
   set: the union of `txn.remote_writes` and the services named in `txn.written`.
   Transitivity matters because a node the originator never contacted may have
   been written by a nested action, and nothing else reports it.
-- `ComposedCall` (task 10) gains `touched_services`, so a **replayed** dispatch
-  reports the same set as the original. A replay that reported a narrower set
-  would invalidate less and serve a stale value.
+- `ComposedCall` (task 10) gains `touched_services: Option<Vec<String>>`, so a
+  **replayed** dispatch reports the same set as the original, and an unknown
+  stays unknown. A replay that reported a narrower set would invalidate less and
+  serve a stale value.
 - The **producer**. Nothing on `main` fills the field, and it is easy to ship
   the whole consumer side without noticing: the participant's `ActionRequest`
   reply in `meerkat/src/main.rs` must call `touched_services_for_txn(&tid)` on
-  success — while the transaction is still in `pending_txns` — and send the
-  result; the failure replies send an empty vec. An unfilled field is
-  indistinguishable from version skew, which is the whole reason step 2 below
-  treats empty as "unknown" rather than "nothing".
+  success — while the transaction is still in `pending_txns` — and send
+  `Some(result)`. The failure replies send `Some(vec![])`; they are about to
+  abort the transaction anyway. A producer that is never wired up looks exactly
+  like an old peer on the wire, which is why step 2 makes `None` conservative
+  rather than benign.
 
 On a successful `ActionResponse`, in `remote_action`:
 
@@ -174,11 +177,19 @@ On a successful `ActionResponse`, in `remote_action`:
    so without this merge a middle node reports only its own services and a
    write two hops down is invisible to the originator, whose cached def then
    stays stale. Validate with `validate_touched_services` before storing.
-2. **An empty reported set means "unknown", not "nothing".** The field is
-   `#[serde(default)]`, so a peer that does not send it decodes as empty.
-   Fall back to recording the slug actually dispatched to, as
-   `record_touched_services` does on the reference branch. Reading empty as
-   "nothing was touched" turns a version skew into silent staleness.
+2. **"Nothing touched" and "not reported" are different answers.** `None` is
+   the peer that did not send the field; `Some(vec![])` is the peer that ran and
+   wrote nothing. Collapsing them into an empty vec turns version skew into
+   silent staleness.
+
+   On `None`, the reference branch's fallback — record the slug dispatched to,
+   as `record_touched_services` does — is not enough. In `client -> mid -> rc`,
+   a `mid` that does not report leaves the client believing only `mid` was
+   touched, so a write on `rc` one hop further down never invalidates anything.
+   Invalidate conservatively instead: every memoised def with any cross-service
+   dependency, plus §3a's walk from each. That is the widest seed for the same
+   primitive, and it is what `refresh_remote_cross_deps_in_txn` did on every
+   composed action.
 3. **Invalidate**, in two steps. First fix what "owned by a touched service"
    means, because the three names involved are not the same name: a reported
    entry is the *owner node's own* service name, `txn.read_cache` is keyed by
@@ -218,9 +229,11 @@ The **replay** branch from task 10 must do all of this too, from the recorded
 the transaction with a narrower touched set and a stale cache than the original
 run produced.
 
-Record the `ComposedCall` **before** the invalidation runs. The invalidation
-path can read, and therefore can park, *inside* the `do` statement — which is
-precisely the case deferred from task 10.
+Record the `ComposedCall` **first**, ahead of the merge, the validation and the
+invalidation. Note what this is and is not: none of those three can park — §3a's
+walk is pure removal and §3b reuses it — so this is ordering discipline, not a
+fix. It keeps the record ahead of the one fallible step there
+(`validate_touched_services`) and ahead of anything fallible added later.
 
 #### 3c. A participant invalidates on its own requests
 
@@ -299,9 +312,11 @@ naming will otherwise invite someone to restore the symmetry.
    criterion. `test_remote_dependency_is_never_served_from_dep_cache` and
    `test_recompute_in_txn_read_locks_same_service_dependencies` are the two that
    most directly constrain this design.
-2. **Restore the deferred test** from task 10:
-   `test_a_park_inside_the_do_statement_does_not_re_send_the_child_action`.
-   §3b gives it a mid-`do` park again.
+2. **The test task 10 could not land stays unlanded.** §3b is pure cache
+   removal and cannot park, so nothing here reintroduces a park *after* a
+   successful dispatch within the same `do`. Do not manufacture one to land
+   `test_a_park_inside_the_do_statement_does_not_re_send_the_child_action`; say
+   in the PR that it is still uncovered.
 3. **New — read, write, read again.** With `def y = x + 1`: read `y`, write
    `x`, read `y` again in one transaction; the second read reflects the write.
    This is the test for §3a, and it is the one that fails if memoisation is
@@ -323,7 +338,9 @@ naming will otherwise invite someone to restore the symmetry.
 8. **New — transitive touched-services reporting.** In a `client -> mid -> rc`
    chain where only `rc` is written, a `client` def over `rc` must see the new
    value. Fails if §3b's merge into `txn.remote_writes` is missing — or if the
-   participant reply never fills the field.
+   participant reply never fills the field. Run the same chain a second time
+   with the field **omitted from the wire** (the old-peer case): the client must
+   still see the new value, via step 2's conservative path.
 9. **New — §3c, both halves.** A participant's def over a *second participant's*
    var, read before and after a composed action that writes it, sees the new
    value. And a participant's def over the **originator's** var, read after the

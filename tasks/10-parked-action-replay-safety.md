@@ -76,7 +76,10 @@ In `remote_action`, **after** the existing `participants.insert`
 pre-registration, claim the next position and short-circuit if it is already
 recorded. That pre-registration currently *moves* the parameter
 (`if let Some(t) = txn` at `manager/mod.rs:1594`); reborrow it as
-`txn.as_deref_mut()` there, or nothing below compiles:
+`txn.as_deref_mut()` there, and change the signature to
+`mut txn: Option<&mut Transaction>`, since `as_deref_mut` borrows the `Option`
+mutably — `lookup` (`manager/mod.rs:539`) already takes it that way. Without
+both, nothing below compiles:
 
 ```rust
 let replay = match txn.as_deref_mut() {
@@ -127,9 +130,10 @@ Three properties this shape gives you, all of which are tested:
   dense, so this is one comparison.
 - Recording happens **before** anything fallible that follows the response. On
   the reference branch that mattered because a cross-service refresh ran there
-  and could itself park. That refresh does not exist in this task, but keep the
-  record as the first thing done with a successful response — the hazard returns
-  in task 12.
+  and could itself park. That refresh does not exist in this task, and task 12
+  replaces it with invalidation that cannot park — but keep the record as the
+  first thing done with a successful response anyway. The ordering is what keeps
+  the question from having to be re-asked each time something is added there.
 
 ## Tests
 
@@ -155,12 +159,14 @@ Also:
 - `test_second_action_under_one_txn_keeps_the_first_write` (why (a) restores
   rather than clears)
 
-### One test is deferred
+### One test has no home yet
 
 ⚠️ `test_a_park_inside_the_do_statement_does_not_re_send_the_child_action`
 depends on `refresh_remote_cross_deps_in_txn` parking *inside* the `do`
-statement, which is eager-propagation machinery we are not taking. **Defer it to
-task 12**, where compute-on-read reintroduces a mid-`do` park.
+statement, which is eager-propagation machinery we are not taking. Task 12 does
+not bring it back either: the work it adds after a successful response is pure
+cache invalidation, which reads nothing and cannot park. **Leave it unlanded and
+record that**, until some step that can read runs after an `ActionResponse`.
 
 Do not weaken it into a park at the *next* statement in order to land it here.
 That is a different case, already covered by the first test, and it would look

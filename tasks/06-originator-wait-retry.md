@@ -60,8 +60,10 @@ terms: `WaitKey::Service(sid)` as `service '<name>'` and
 
 ### 3. Pace the retries
 
-Add `async fn wait_die_backoff()` sleeping `WAIT_DIE_RETRY_BACKOFF_MS` (2ms) and
-call it before `continue`.
+Add `async fn retry_backoff(ms: u64)` and call it before `continue` with the
+backoff **the outcome selects**: `WAIT_DIE_RETRY_BACKOFF_MS` (2ms) for
+`WaitDieAbort`, `WAIT_ON_RETRY_BACKOFF_MS` (20ms) for `WaitOn`. A single 2ms
+helper wired to both compiles, reads fine, and silently keeps the defect below.
 
 This is not cosmetic. A transaction with **no participants** never awaits
 anything on the retry path — there is no `send_abort` to make — so without a
@@ -75,9 +77,8 @@ natively, `gloo_timers::future::TimeoutFuture` wrapped in `send_wrapper::SendWra
 on `wasm32` (wasm has no tokio timer driver in the browser, and the eval path is
 `Send`-bounded).
 
-Pace the two outcomes differently. A **die** wants to re-run promptly, so 2ms
-is right for it. A **wait** must give the holder time to commit, so give
-`WaitOn` its own `WAIT_ON_RETRY_BACKOFF_MS` (20ms).
+The two durations differ because the outcomes do: a **die** re-runs promptly,
+while a **wait** must give the holder time to commit.
 
 Document the limit honestly, because the shape of §1 has a consequence worth
 naming: `MAX_WAIT_DIE_RETRIES` (10) doubles as the originator's wait
@@ -92,7 +93,8 @@ message loop of #28.
 ## Tests
 
 `meerkat-lib/tests/originator_wait_test.rs` (2 tests) plus the unit test
-`test_wait_die_retries_are_paced`.
+`test_wait_die_retries_are_paced` — which must pin *which* backoff each outcome
+gets, not merely that some sleep happens.
 
 **Illustrating test:** `test_originator_retries_the_transaction_on_a_wait` — a
 stand-in network peer counts the `Abort` messages it receives. Each attempt
