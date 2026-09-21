@@ -159,7 +159,12 @@ impl<'a> Imports<'a> {
         }
     }
 
-    /// Process incoming source code for a service
+    /// Process source code arriving over the network for a service
+    ///
+    /// Clears the request tracking for `service_name` and then records the
+    /// file. Only for network arrivals: local disk imports are read
+    /// synchronously by `resolve_import`, which calls `record_source`
+    /// directly because it has nothing pending to clear.
     ///
     /// Args:
     ///   `source` (`&str`): Raw source text received
@@ -177,13 +182,6 @@ impl<'a> Imports<'a> {
         service_name: &str,
         base_dir: &Path,
     ) -> Result<Vec<ImportCommand>> {
-        if self.visited_services.len() >= MAX_IMPORTED_SERVICES {
-            return Err(Error::LimitExceeded(format!(
-                "imported service count exceeds maximum limit of {}",
-                MAX_IMPORTED_SERVICES
-            )));
-        }
-
         if !self.pending_services.contains(service_name) {
             // Log unsolicited response rather than failing, which aids testing
             // and speculative pushes
@@ -196,6 +194,35 @@ impl<'a> Imports<'a> {
         self.pending_services.remove(service_name);
         self.pending_network
             .retain(|_, req| req.service_name != service_name);
+
+        self.record_source(source, base_dir)
+    }
+
+    /// Record a resolved import's source and resolve its own imports in turn
+    ///
+    /// The half of import resolution that is the same however the source was
+    /// obtained. Says nothing about request tracking, so the local disk path
+    /// can share it without having to claim a request was outstanding.
+    ///
+    /// The services it provides are taken from the source itself, so unlike
+    /// `on_recv_source` this does not need to be told which one was asked for.
+    ///
+    /// Args:
+    ///   `source` (`&str`): Raw source text of the imported file
+    ///   `base_dir` (`&Path`): Directory for local imports
+    ///
+    /// Returns:
+    ///   `Result<Vec<ImportCommand>>`: Fetch commands for its own imports
+    ///
+    /// Errors:
+    ///   `Error`: If source parsing or local disk reading fails
+    fn record_source(&mut self, source: &str, base_dir: &Path) -> Result<Vec<ImportCommand>> {
+        if self.visited_services.len() >= MAX_IMPORTED_SERVICES {
+            return Err(Error::LimitExceeded(format!(
+                "imported service count exceeds maximum limit of {}",
+                MAX_IMPORTED_SERVICES
+            )));
+        }
 
         let parsed_stmts = parser::parse_string(source, self.interner)
             .map_err(|e| Error::Message(e.to_string()))?;
@@ -469,6 +496,10 @@ impl<'a> Imports<'a> {
             ))
         })?;
 
-        self.on_recv_source(&source, &service_name, base_dir)
+        // `record_source`, not `on_recv_source`: the file was just read from
+        // disk, so there is no outstanding network request to clear. Going
+        // through the network entry point would report it as an unsolicited
+        // response on every startup that resolves a local import.
+        self.record_source(&source, base_dir)
     }
 }

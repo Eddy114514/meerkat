@@ -446,7 +446,7 @@ async fn test_on_node_startup_also_orders_imports_first() {
 
 /// The same ordering must hold when the modules arrive over the network.
 ///
-/// Local disk resolution recurses through `on_recv_source`, so the disk test
+/// Local disk resolution recurses through `record_source`, so the disk test
 /// above already exercises the arrival order indirectly. Over the network the
 /// replies arrive as separate events, which is the case `Imports` was actually
 /// reported for: `main -> a -> b` is recorded as `[a, b]` because a file's own
