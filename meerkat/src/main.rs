@@ -264,14 +264,9 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 let server_addr = opt_server_addr
                     .expect("Server address should be initialized when args.server is true");
 
-                let target_ast = if remote_url_map.is_empty() {
-                    node.unified_ast.clone()
-                } else {
-                    prog
-                };
-
                 run_server(
-                    target_ast,
+                    node.unified_ast.clone(),
+                    prog,
                     file,
                     remote_url_map,
                     ServerConfig {
@@ -288,7 +283,6 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 run_client(
                     node.unified_ast.clone(),
                     prog,
-                    file,
                     remote_url_map,
                     args.local,
                     args.watch,
@@ -475,6 +469,7 @@ struct ServerConfig {
 }
 
 async fn run_server(
+    full_ast: Vec<Stmt>,
     prog: Vec<Stmt>,
     input_file: &str,
     remote_url_map: std::collections::HashMap<String, String>,
@@ -492,6 +487,10 @@ async fn run_server(
 
     let mut manager = Manager::new(interner);
     manager.local = config.local;
+    // The dependency-ordered AST of this program plus everything it imports.
+    // `register_and_instantiate_imports` walks it, and runtime updates against
+    // remote services resolve their targets through it.
+    manager.unified_ast = full_ast;
 
     let (mut net, full_addr) = match pre_init {
         Some(pair) => pair,
@@ -559,20 +558,19 @@ async fn run_server(
         }
     }
 
-    // Register any remote services from -i flags
-    for (svc_name, url) in &remote_url_map {
-        let svc_sym = manager.interner.insert(svc_name);
-        manager
-            .remote_services
-            .insert(svc_sym, Address::new(url.as_str()));
-        println!("Remote service '{}' registered at {}", svc_name, url);
-    }
-
     // Wire network into manager so server can also do remote lookups
     manager.network = Some(net);
     // Record the canonical address so service identities are stable and match
     // the advertised Service URLs above.
     manager.set_local_address(full_addr.clone());
+
+    // Register the -i remotes and build the imported services. After the
+    // network is wired, so that remote lookups during service initialization
+    // work correctly.
+    manager
+        .register_and_instantiate_imports(&prog, &remote_url_map)
+        .await
+        .map_err(|e| format!("Import service error: {}", e))?;
 
     // Load services after network and remote services are ready,
     // so that remote lookups during service initialization work correctly
@@ -997,7 +995,6 @@ async fn run_server(
 async fn run_client(
     full_ast: Vec<Stmt>,
     prog: Vec<Stmt>,
-    input_file: &str,
     remote_url_map: std::collections::HashMap<String, String>,
     local: bool,
     watch: bool,
@@ -1046,6 +1043,13 @@ async fn run_client(
     if let Some(addr) = local_full_addr {
         manager.set_local_address(addr);
     }
+
+    // Register the -i remotes and build the imported services, before any of
+    // this program's own.
+    manager
+        .register_and_instantiate_imports(&prog, &remote_url_map)
+        .await
+        .map_err(|e| format!("Import service error: {}", e))?;
 
     for stmt in &prog {
         match stmt {
@@ -1098,37 +1102,10 @@ async fn run_client(
                     println!("@test({}) passed", manager.interner.get(service_name));
                 }
             }
-            &Stmt::Import {
-                ref path,
-                service_name,
-            } => {
-                if let Some(url) = remote_url_map.get(manager.interner.get(service_name)) {
-                    manager
-                        .remote_services
-                        .insert(service_name, Address::new(url.as_str()));
-                    println!(
-                        "Remote service '{}' registered at {}",
-                        manager.interner.get(service_name),
-                        url
-                    );
-                } else {
-                    let base_dir = std::path::Path::new(input_file)
-                        .parent()
-                        .unwrap_or(std::path::Path::new("."));
-                    let import_path = base_dir.join(path);
-                    let import_stmts =
-                        parser::parse_file(import_path.to_str().unwrap(), &mut manager.interner)
-                            .map_err(|e| format!("Import parse error: {}", e))?;
-                    for import_stmt in &import_stmts {
-                        if let &Stmt::Service { name, ref decls } = import_stmt {
-                            manager
-                                .create_service(name, decls.clone())
-                                .await
-                                .map_err(|e| format!("Import service error: {}", e))?;
-                            println!("Imported service '{}'", manager.interner.get(name));
-                        }
-                    }
-                }
+            Stmt::Import { path, .. } => {
+                // Remote services were registered, and local imports
+                // instantiated, before this loop started.
+                let _ = path;
             }
             &Stmt::ActionStmt(_) | &Stmt::Connect { .. } | &Stmt::Watch { .. } => {}
         }

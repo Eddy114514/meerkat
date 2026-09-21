@@ -476,13 +476,12 @@ impl Node {
         manager.unified_ast = self.unified_ast.clone();
         manager.local_services = self.local_services;
 
-        for (svc_name, url) in &remote_url_map {
-            let svc_sym = manager.interner.insert(svc_name);
-            manager
-                .remote_services
-                .insert(svc_sym, Address::new(url.as_str()));
-            println!("Remote service '{}' registered at {}", svc_name, url);
-        }
+        // The local set comes from `local_ast`, not `self.unified_ast`: the
+        // unified AST also holds the resolved bodies of imported services, so a
+        // local set taken from it would treat every import as locally declared
+        // and skip its `-i` flag.
+        let local = crate::runtime::manager::local_service_names(local_ast);
+        manager.register_remote_services(&remote_url_map, &local);
 
         for stmt in local_ast {
             match stmt {
@@ -780,6 +779,47 @@ mod tests {
     use super::*;
     use crate::ast::{ActionStmt, BinOp, Decl, Expr, Value};
     use crate::runtime::tt::Type;
+
+    /// The third registration path must refuse a colliding `-i` flag too.
+    ///
+    /// `run_server` and `run_client` both go through
+    /// `Manager::register_remote_services`, but so does `on_manager_startup`,
+    /// which is the path the test harnesses use. A copy of the guard in the
+    /// binary alone would leave this one registering a locally declared
+    /// service as remote, where `lookup` prefers it over the local copy.
+    #[tokio::test]
+    async fn on_manager_startup_skips_locally_declared_services() {
+        let mut node = Node::new();
+        let s2 = node.interner.insert("s2");
+        let local_ast = vec![Stmt::Service {
+            name: s2,
+            decls: vec![Decl::VarDecl {
+                name: node.interner.insert("x"),
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 0 },
+                },
+            }],
+        }];
+        node.unified_ast = local_ast.clone();
+
+        let mut urls = HashMap::new();
+        urls.insert("s2".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+
+        let manager = node
+            .on_manager_startup(true, None, urls, &local_ast)
+            .await
+            .expect("startup succeeds");
+
+        assert!(
+            !manager.remote_services.contains_key(&s2),
+            "a locally declared service must never be registered as remote"
+        );
+        assert!(
+            manager.services.contains_key(&s2),
+            "and it must still be served locally"
+        );
+    }
 
     /// Verify error mapping when apply_updates_to_ast encounters an unknown
     /// target service symbol
