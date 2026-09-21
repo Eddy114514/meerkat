@@ -246,6 +246,11 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             .static_checks()
             .map_err(|e| format!("Static check error: {}", e))?;
 
+            // `run_server` and `run_client` build their `Manager` directly
+            // rather than through `Node::on_manager_startup`, so they need
+            // the peers discovered during resolution merged in here.
+            node.merge_discovered_remote_services(&mut remote_url_map);
+
             // This mode must appear before `server` args check in
             // order to properly stop execution. Logic for static
             // checks must not occur in this branch, as the intent

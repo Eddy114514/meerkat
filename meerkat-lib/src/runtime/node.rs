@@ -33,6 +33,10 @@ pub struct Node {
     pub imported_services: Env<'static, ServiceType>,
     /// Unified program statements AST
     pub unified_ast: Vec<Stmt>,
+    /// Services a peer serves because a network-fetched module declares them.
+    /// Service name to serving URL, in the same shape as the `-i` map, which
+    /// it is merged into at startup. See `Imports::remote_service_owners`.
+    pub discovered_remote_services: HashMap<String, String>,
     /// Process string interner
     pub interner: Interner,
 }
@@ -47,6 +51,7 @@ impl Node {
             local_services: Env::new(None),
             imported_services: Env::new(None),
             unified_ast: Vec::new(),
+            discovered_remote_services: HashMap::new(),
             interner: Interner::new(),
         }
     }
@@ -312,7 +317,11 @@ impl Node {
             }
         }
 
-        Ok((imports.finalize(), buffered_events))
+        // Before `finalize`, which consumes the state machine.
+        let owners = imports.remote_service_owners();
+        let stmts = imports.finalize();
+        self.discovered_remote_services = owners;
+        Ok((stmts, buffered_events))
     }
 
     /// Assemble `unified_ast` from a program and its resolved imports.
@@ -450,6 +459,25 @@ impl Node {
         }
     }
 
+    /// Add the peers discovered during import resolution to an `-i` map
+    ///
+    /// A module fetched from a peer is that peer's own program, so the peer
+    /// serves every service the module declares -- including siblings that no
+    /// `-i` flag named. Without this they look local and are instantiated here
+    /// as divergent copies. See `Imports::remote_service_owners`.
+    ///
+    /// An explicit `-i` flag wins: it is what the user actually asked for.
+    ///
+    /// Args:
+    ///   `remote_url_map` (`&mut HashMap<String, String>`): Map to extend
+    pub fn merge_discovered_remote_services(&self, remote_url_map: &mut HashMap<String, String>) {
+        for (svc, url) in &self.discovered_remote_services {
+            remote_url_map
+                .entry(svc.clone())
+                .or_insert_with(|| url.clone());
+        }
+    }
+
     /// Consume the Node and create a runtime Manager
     ///
     /// Args:
@@ -470,6 +498,9 @@ impl Node {
         remote_url_map: HashMap<String, String>,
         local_ast: &[Stmt],
     ) -> Result<Manager> {
+        let mut remote_url_map = remote_url_map;
+        self.merge_discovered_remote_services(&mut remote_url_map);
+
         let mut manager = Manager::new(self.interner);
         manager.local = local;
         manager.network = network;
@@ -880,6 +911,74 @@ mod tests {
             "the imported service must be instantiated"
         );
         assert!(manager.services.contains_key(&app));
+    }
+
+    /// A service co-declared by a network-fetched module must not be built
+    /// locally.
+    ///
+    /// `Imports::remote_service_owners` reports that the peer serving `a.mkt`
+    /// also serves the `b` it declares (covered in `imports_test.rs`); this is
+    /// the other half, that startup honours the report. Without it `b` is
+    /// neither locally declared nor `-i`-registered, so it looks like an
+    /// ordinary local import and startup instantiates a divergent copy of a
+    /// service the peer already serves.
+    #[tokio::test]
+    async fn on_manager_startup_does_not_localize_a_peers_co_declared_service() {
+        let mut node = Node::new();
+        let a = node.interner.insert("a");
+        let b = node.interner.insert("b");
+        let app = node.interner.insert("app");
+
+        let svc = |name: crate::runtime::interner::Symbol,
+                   member: crate::runtime::interner::Symbol| Stmt::Service {
+            name,
+            decls: vec![Decl::VarDecl {
+                name: member,
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 1 },
+                },
+            }],
+        };
+        let x = node.interner.insert("x");
+        let local_ast = vec![svc(app, x)];
+        node.unified_ast = vec![svc(a, x), svc(b, x), svc(app, x)];
+
+        // What resolving `import a` against `-i /ip4/.../peer_a/a` produces
+        // when the returned `a.mkt` declares both `a` and `b`.
+        node.discovered_remote_services.insert(
+            "a".to_string(),
+            "/ip4/127.0.0.1/tcp/9000/p2p/peer_a/a".to_string(),
+        );
+        node.discovered_remote_services.insert(
+            "b".to_string(),
+            "/ip4/127.0.0.1/tcp/9000/p2p/peer_a/b".to_string(),
+        );
+
+        let mut urls = HashMap::new();
+        urls.insert(
+            "a".to_string(),
+            "/ip4/127.0.0.1/tcp/9000/p2p/peer_a/a".to_string(),
+        );
+
+        let manager = node
+            .on_manager_startup(true, None, urls, &local_ast)
+            .await
+            .expect("startup succeeds");
+
+        assert!(
+            !manager.services.contains_key(&b),
+            "a service the peer serves must not be built as a local phantom"
+        );
+        assert!(
+            manager.remote_services.contains_key(&b),
+            "it must be reachable at the peer that declared it"
+        );
+        assert!(!manager.services.contains_key(&a), "nor may `a` be");
+        assert!(
+            manager.services.contains_key(&app),
+            "the program's own services are still created"
+        );
     }
 
     /// Verify error mapping when apply_updates_to_ast encounters an unknown

@@ -42,6 +42,23 @@ struct ImportedModule {
     imports: Vec<Symbol>,
     /// The file's parsed statements.
     stmts: Vec<Stmt>,
+    /// Address of the peer this file was fetched from, if it came over the
+    /// network. That peer runs the file as its own program, so it serves
+    /// every service the file declares -- not only the one that was asked
+    /// for. `None` for a file read from local disk, which this node serves.
+    remote_peer: Option<String>,
+}
+
+/// Strip the service slug from an import URL, leaving the peer address.
+///
+/// `-i` URLs end with the slug of the service they serve
+/// (`meerkat/src/main.rs` derives the slug from exactly that segment), and
+/// `Manager::remote_addr` strips it again to dial the peer. Removing it here
+/// lets a sibling service's URL be built against the same peer.
+fn peer_address(url: &str, service_name: &str) -> String {
+    url.strip_suffix(&format!("/{}", service_name))
+        .unwrap_or(url)
+        .to_string()
 }
 
 /// State machine for resolving module import dependencies
@@ -195,7 +212,13 @@ impl<'a> Imports<'a> {
         self.pending_network
             .retain(|_, req| req.service_name != service_name);
 
-        self.record_source(source, base_dir)
+        // The peer that served this file owns everything the file declares.
+        let remote_peer = self
+            .remote_url_map
+            .get(service_name)
+            .map(|url| peer_address(url, service_name));
+
+        self.record_source(source, base_dir, remote_peer)
     }
 
     /// Record a resolved import's source and resolve its own imports in turn
@@ -216,7 +239,12 @@ impl<'a> Imports<'a> {
     ///
     /// Errors:
     ///   `Error`: If source parsing or local disk reading fails
-    fn record_source(&mut self, source: &str, base_dir: &Path) -> Result<Vec<ImportCommand>> {
+    fn record_source(
+        &mut self,
+        source: &str,
+        base_dir: &Path,
+        remote_peer: Option<String>,
+    ) -> Result<Vec<ImportCommand>> {
         if self.visited_services.len() >= MAX_IMPORTED_SERVICES {
             return Err(Error::LimitExceeded(format!(
                 "imported service count exceeds maximum limit of {}",
@@ -254,6 +282,7 @@ impl<'a> Imports<'a> {
                 })
                 .collect(),
             stmts: parsed_stmts.clone(),
+            remote_peer,
         });
 
         let mut new_cmds = Vec::new();
@@ -455,6 +484,34 @@ impl<'a> Imports<'a> {
         ordered
     }
 
+    /// Services owned by a peer because a network-fetched module declares them
+    ///
+    /// A module fetched from a peer is that peer's own program, so it serves
+    /// every service the module declares. Only the service actually named by
+    /// an `-i` flag is registered from the command line; a sibling declared in
+    /// the same file has no flag of its own and would otherwise be taken for a
+    /// local service and instantiated here as a divergent copy.
+    ///
+    /// Keyed by service name, valued by the URL serving it, so the result
+    /// merges directly into the `-i` map. Empty unless imports were fetched
+    /// over the network: a module read from local disk is served by this node.
+    ///
+    /// Returns:
+    ///   `HashMap<String, String>`: Service name to serving URL
+    pub fn remote_service_owners(&self) -> HashMap<String, String> {
+        let mut owners = HashMap::new();
+        for module in &self.modules {
+            if let Some(peer) = &module.remote_peer {
+                for declared in &module.declares {
+                    let name = self.interner.get(*declared).to_string();
+                    let url = format!("{}/{}", peer, name);
+                    owners.insert(name, url);
+                }
+            }
+        }
+        owners
+    }
+
     /// Private helper to resolve a single import symbol
     fn resolve_import(
         &mut self,
@@ -500,6 +557,6 @@ impl<'a> Imports<'a> {
         // disk, so there is no outstanding network request to clear. Going
         // through the network entry point would report it as an unsolicited
         // response on every startup that resolves a local import.
-        self.record_source(&source, base_dir)
+        self.record_source(&source, base_dir, None)
     }
 }
