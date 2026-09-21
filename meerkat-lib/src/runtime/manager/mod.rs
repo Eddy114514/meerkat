@@ -267,6 +267,10 @@ impl Manager {
     /// the ordering below is established once rather than re-derived per
     /// caller. `unified_ast` must already be set.
     ///
+    /// `remote_url_map` maps a service slug to the address serving it. The CLI
+    /// builds it from repeated `-i <url>` flags, taking the slug from each
+    /// URL's final path segment (`meerkat/src/main.rs`).
+    ///
     /// Errors:
     ///   `EvalError`: If instantiating an imported service fails
     pub async fn register_and_instantiate_imports(
@@ -314,14 +318,20 @@ impl Manager {
         Ok(())
     }
 
-    /// Apply the `-i svc=url` registrations.
+    /// Record each entry of `remote_url_map` -- service slug to the address
+    /// serving it -- in `remote_services`.
+    ///
+    /// The CLI builds that map from repeated `-i <url>` flags, taking the slug
+    /// from each URL's final path segment (`meerkat/src/main.rs`); a slug is
+    /// therefore whatever the URL happens to end with, not something the user
+    /// states outright.
     ///
     /// A service this program declares itself is never registered as remote,
     /// whatever `-i` says. `lookup` consults `remote_services` before anything
     /// local, so a slug collision would otherwise route a locally declared
     /// service's reads and writes to a peer and leave the local copy
-    /// unreachable. The name is almost certainly a mistake on the command line,
-    /// so it is reported rather than quietly dropped.
+    /// unreachable. Since the slug is implicit, such a collision is easy to
+    /// hit by accident, so it is reported rather than quietly dropped.
     pub fn register_remote_services(
         &mut self,
         remote_url_map: &HashMap<String, String>,

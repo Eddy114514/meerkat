@@ -476,12 +476,20 @@ impl Node {
         manager.unified_ast = self.unified_ast.clone();
         manager.local_services = self.local_services;
 
-        // The local set comes from `local_ast`, not `self.unified_ast`: the
-        // unified AST also holds the resolved bodies of imported services, so a
-        // local set taken from it would treat every import as locally declared
-        // and skip its `-i` flag.
-        let local = crate::runtime::manager::local_service_names(local_ast);
-        manager.register_remote_services(&remote_url_map, &local);
+        // Register the `-i` remotes and instantiate every locally resolved
+        // import, before the loop below creates this program's own services:
+        // a service may read an import, and `create_service` resolves that
+        // read immediately.
+        //
+        // `local_ast`, not `self.unified_ast`, is what marks a service as
+        // locally declared. The unified AST also holds the resolved bodies of
+        // imported services, so a local set taken from it would treat every
+        // import as locally declared -- skipping its `-i` flag, and leaving it
+        // to the loop below, which never sees it.
+        manager
+            .register_and_instantiate_imports(local_ast, &remote_url_map)
+            .await
+            .map_err(|e| Error::Message(format!("Import service error: {}", e)))?;
 
         for stmt in local_ast {
             match stmt {
@@ -819,6 +827,59 @@ mod tests {
             manager.services.contains_key(&s2),
             "and it must still be served locally"
         );
+    }
+
+    /// A locally resolved import must be instantiated before the program's own
+    /// services, on this path too.
+    ///
+    /// This is the shape `on_node_startup` produces: `unified_ast` holds the
+    /// imported modules ahead of the root program, and the `local_ast` handed
+    /// back names only the root program's own services. Creating `app` without
+    /// having created the `dep` it reads fails with `ServiceNotFound`.
+    #[tokio::test]
+    async fn on_manager_startup_instantiates_locally_resolved_imports() {
+        let mut node = Node::new();
+        let dep = node.interner.insert("dep");
+        let app = node.interner.insert("app");
+        let x = node.interner.insert("x");
+        let y = node.interner.insert("y");
+
+        let dep_stmt = Stmt::Service {
+            name: dep,
+            decls: vec![Decl::VarDecl {
+                name: x,
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 1 },
+                },
+            }],
+        };
+        let app_stmt = Stmt::Service {
+            name: app,
+            decls: vec![Decl::DefDecl {
+                name: y,
+                ty: None,
+                val: Expr::MemberAccess {
+                    service_name: dep,
+                    member_name: x,
+                },
+                is_pub: false,
+            }],
+        };
+
+        let local_ast = vec![app_stmt.clone()];
+        node.unified_ast = vec![dep_stmt, app_stmt];
+
+        let manager = node
+            .on_manager_startup(true, None, HashMap::new(), &local_ast)
+            .await
+            .expect("startup succeeds");
+
+        assert!(
+            manager.services.contains_key(&dep),
+            "the imported service must be instantiated"
+        );
+        assert!(manager.services.contains_key(&app));
     }
 
     /// Verify error mapping when apply_updates_to_ast encounters an unknown

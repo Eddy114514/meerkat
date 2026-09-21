@@ -468,6 +468,47 @@ struct ServerConfig {
     identity: Option<std::path::PathBuf>,
 }
 
+/// Populate a server `Manager` with the program's services: the unified AST,
+/// the configured remote services and the locally resolved imports, then the
+/// services this program declares itself, in program order.
+///
+/// Split out of `run_server` so that this sequence can be tested without
+/// standing up a network or entering the event loop. It is the part of server
+/// startup that has no network dependency of its own -- the caller wires the
+/// network into `manager` first, because instantiating a service may issue a
+/// remote lookup.
+///
+/// `full_ast` is the dependency-ordered AST of this program plus everything it
+/// imports, and must be kept distinct from `prog`. Server mode once passed the
+/// program alone whenever any `-i` flag was present, which silently dropped
+/// every import and left services that read one failing with `ServiceNotFound`.
+async fn init_server_services(
+    manager: &mut Manager,
+    full_ast: Vec<Stmt>,
+    prog: &[Stmt],
+    remote_url_map: &std::collections::HashMap<String, String>,
+) -> Result<(), Box<dyn Error>> {
+    // `register_and_instantiate_imports` walks this, and runtime updates
+    // against remote services resolve their targets through it.
+    manager.unified_ast = full_ast;
+
+    manager
+        .register_and_instantiate_imports(prog, remote_url_map)
+        .await
+        .map_err(|e| format!("Import service error: {}", e))?;
+
+    for stmt in prog {
+        if let Stmt::Service { name, decls } = stmt {
+            manager
+                .create_service(*name, decls.clone())
+                .await
+                .map_err(|e| format!("Service error: {}", e))?;
+            println!("Service '{}' loaded", manager.interner.get(*name));
+        }
+    }
+    Ok(())
+}
+
 async fn run_server(
     full_ast: Vec<Stmt>,
     prog: Vec<Stmt>,
@@ -487,10 +528,6 @@ async fn run_server(
 
     let mut manager = Manager::new(interner);
     manager.local = config.local;
-    // The dependency-ordered AST of this program plus everything it imports.
-    // `register_and_instantiate_imports` walks it, and runtime updates against
-    // remote services resolve their targets through it.
-    manager.unified_ast = full_ast;
 
     let (mut net, full_addr) = match pre_init {
         Some(pair) => pair,
@@ -564,25 +601,9 @@ async fn run_server(
     // the advertised Service URLs above.
     manager.set_local_address(full_addr.clone());
 
-    // Register the -i remotes and build the imported services. After the
-    // network is wired, so that remote lookups during service initialization
-    // work correctly.
-    manager
-        .register_and_instantiate_imports(&prog, &remote_url_map)
-        .await
-        .map_err(|e| format!("Import service error: {}", e))?;
-
-    // Load services after network and remote services are ready,
-    // so that remote lookups during service initialization work correctly
-    for stmt in &prog {
-        if let Stmt::Service { name, decls } = stmt {
-            manager
-                .create_service(*name, decls.clone())
-                .await
-                .map_err(|e| format!("Service error: {}", e))?;
-            println!("Service '{}' loaded", manager.interner.get(*name));
-        }
-    }
+    // Called after the network is wired, so that remote lookups during
+    // service initialization work correctly.
+    init_server_services(&mut manager, full_ast, &prog, &remote_url_map).await?;
 
     println!("Server running, press Ctrl+C to stop...");
 
@@ -1574,6 +1595,72 @@ mod tests {
         assert!(
             !exceeds_pending_update_limit(&queue, "peer2"),
             "Should allow new updates from different peers"
+        );
+    }
+
+    /// Build the two ASTs `init_server_services` takes: the dependency-ordered
+    /// program-plus-imports AST, and the root program on its own.
+    fn server_asts(interner: &mut Interner) -> (Vec<Stmt>, Vec<Stmt>) {
+        let full = parser::parse_string(
+            "service dep { var x = 1; } service app { def y = dep.x + 1; }",
+            interner,
+        )
+        .expect("fixture parses");
+        let prog = parser::parse_string("service app { def y = dep.x + 1; }", interner)
+            .expect("fixture parses");
+        (full, prog)
+    }
+
+    /// Server mode must instantiate a locally resolved import before the
+    /// service that reads it.
+    ///
+    /// `run_server` had no instantiation step at all: it created only the
+    /// services in `prog`, so `app`'s read of `dep` failed with
+    /// `ServiceNotFound` before the server ever reached its event loop.
+    #[tokio::test]
+    async fn init_server_services_instantiates_locally_resolved_imports() {
+        let mut interner = Interner::new();
+        let (full, prog) = server_asts(&mut interner);
+        let app = interner.insert("app");
+        let dep = interner.insert("dep");
+
+        let mut manager = Manager::new(interner);
+        manager.local = true;
+        init_server_services(&mut manager, full, &prog, &std::collections::HashMap::new())
+            .await
+            .expect("server startup succeeds");
+
+        assert!(
+            manager.services.contains_key(&dep),
+            "the imported service must be instantiated"
+        );
+        assert!(manager.services.contains_key(&app));
+    }
+
+    /// The same, with an unrelated `-i` flag present.
+    ///
+    /// This is the configuration the deleted `target_ast` ternary broke: any
+    /// `-i` flag made the caller pass the root program in place of the unified
+    /// AST, dropping every import. A flag naming some other service must not
+    /// change which services this program brings up.
+    #[tokio::test]
+    async fn init_server_services_keeps_imports_when_an_unrelated_remote_is_configured() {
+        let mut interner = Interner::new();
+        let (full, prog) = server_asts(&mut interner);
+        let dep = interner.insert("dep");
+
+        let mut remotes = std::collections::HashMap::new();
+        remotes.insert("far".to_string(), "/ip4/127.0.0.1/tcp/9000/far".to_string());
+
+        let mut manager = Manager::new(interner);
+        manager.local = true;
+        init_server_services(&mut manager, full, &prog, &remotes)
+            .await
+            .expect("server startup succeeds");
+
+        assert!(
+            manager.services.contains_key(&dep),
+            "an unrelated -i flag must not strip the program's imports"
         );
     }
 }
