@@ -259,7 +259,7 @@ impl Manager {
         }
     }
 
-    /// Register the `-i svc=url` flags, then instantiate every locally
+    /// Register the parsed `-i <url>` mappings, then instantiate every locally
     /// resolved import. Steps 1-3 of CLI startup; the caller then creates the
     /// services the program declares itself, in program order.
     ///
