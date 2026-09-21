@@ -13,7 +13,8 @@ use crate::net::ClockEntry;
 use crate::runtime::ast::{ActionStmt, BinOp, Expr, Field, TableType, UnOp, Value};
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::limits::{
-    MAX_IDENTIFIER_LENGTH, MAX_NET_REQUEST_STRING_LENGTH, MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH,
+    MAX_IDENTIFIER_LENGTH, MAX_NET_REQUEST_SOURCE_LENGTH, MAX_NET_REQUEST_STRING_LENGTH,
+    MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH,
 };
 use crate::runtime::tt::{Param, ServiceType, TupleType, Type};
 use crate::runtime::txn::VClock;
@@ -70,6 +71,61 @@ pub fn validate_service_code_request(path: &str, reply_to: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Validate incoming `ServiceCodeResponse` source and path, returning the
+/// validated service name
+///
+/// Args:
+///     `path` (`&str`): Requested file path
+///     `source` (`&str`): Received source code
+///
+/// Returns:
+///     `Result<String>`: Validated service name
+///
+/// Raises:
+///     `Error::LimitExceeded`: If `source` length exceeds limit or `path` is invalid
+pub fn decode_source_response(path: &str, source: &str) -> Result<String> {
+    if source.len() > MAX_NET_REQUEST_SOURCE_LENGTH {
+        return Err(Error::LimitExceeded(format!(
+            "source size exceeds maximum length of {} bytes",
+            MAX_NET_REQUEST_SOURCE_LENGTH
+        )));
+    }
+    let service_name = path.strip_suffix(".mkt").unwrap_or(path);
+    validate_identifier(service_name)?;
+    Ok(service_name.to_string())
+}
+
+/// Validate and decode an `UpdateServiceRequest` arriving over the wire
+///
+/// Enforces zero-trust identifier and payload size limits
+///
+/// Args:
+///     `service_name` (`&str`): Name of the service to update
+///     `source` (`&str`): Source code payload
+///     `interner` (`&mut Interner`): Interner for symbol creation
+///
+/// Returns:
+///     `Result<(Symbol, String)>`: Validated interned service symbol
+///     and source string
+///
+/// Raises:
+///     `Error::LimitExceeded`: If identifier is invalid or source exceeds
+///     max length
+pub fn decode_update_service_request(
+    service_name: &str,
+    source: &str,
+    interner: &mut Interner,
+) -> Result<(Symbol, String)> {
+    validate_identifier(service_name)?;
+    if source.len() > MAX_NET_REQUEST_SOURCE_LENGTH {
+        return Err(Error::LimitExceeded(format!(
+            "source size exceeds maximum length of {} bytes",
+            MAX_NET_REQUEST_SOURCE_LENGTH
+        )));
+    }
+    Ok((interner.insert(service_name), source.to_string()))
 }
 
 /// Validate identifier fields of a `LookupRequest` message arriving over
@@ -302,7 +358,7 @@ fn encode_type_internal(ty: &Type, depth: usize) -> Result<NetType> {
             }
             Ok(NetType::Tuple(encoded_ts))
         }
-        Type::Func(t1, t2) => {
+        Type::Func(t1, t2, _) => {
             let et1 = encode_type_internal(t1, depth + 1)?;
             let et2 = encode_type_internal(t2, depth + 1)?;
             Ok(NetType::Func(Box::new(et1), Box::new(et2)))
@@ -345,7 +401,7 @@ pub fn encode_type(ty: &Type) -> Result<NetType> {
 ///
 /// Raises:
 ///     `Error::Message`: If a field is missing due to a broken invariant
-pub fn encode_servicetype<'a>(st: &ServiceType<'a>, interner: &Interner) -> Result<NetServiceType> {
+pub fn encode_servicetype(st: &ServiceType, interner: &Interner) -> Result<NetServiceType> {
     let mut fields = Vec::new();
     for name in st.field_order() {
         let name_str = interner.get(*name).to_string();
@@ -410,7 +466,11 @@ fn decode_type_internal(ty: NetType, depth: usize) -> Result<Type> {
         NetType::Func(t1, t2) => {
             let dt1 = decode_type_internal(*t1, depth + 1)?;
             let dt2 = decode_type_internal(*t2, depth + 1)?;
-            Ok(Type::Func(Box::new(dt1), Box::new(dt2)))
+            Ok(Type::Func(
+                Box::new(dt1),
+                Box::new(dt2),
+                std::collections::HashSet::new(),
+            ))
         }
         NetType::List(t) => {
             let dt = decode_type_internal(*t, depth + 1)?;
@@ -444,10 +504,7 @@ pub fn decode_type(ty: NetType) -> Result<Type> {
 ///
 /// Returns:
 ///     `Result<ServiceType>`: The decoded runtime service type
-pub fn decode_servicetype<'a>(
-    nst: NetServiceType,
-    interner: &mut Interner,
-) -> Result<ServiceType<'a>> {
+pub fn decode_servicetype(nst: NetServiceType, interner: &mut Interner) -> Result<ServiceType> {
     let mut st = ServiceType::default();
     for (name_str, net_ty) in nst.fields {
         validate_identifier(&name_str)?;
@@ -1817,8 +1874,17 @@ mod tests {
 
         // Construct `Type::Func(Int -> String, Bool -> Unit)`
         let original_type = Type::Func(
-            Box::new(Type::Func(Box::new(Type::Int), Box::new(Type::String))),
-            Box::new(Type::Func(Box::new(Type::Bool), Box::new(Type::Unit))),
+            Box::new(Type::Func(
+                Box::new(Type::Int),
+                Box::new(Type::String),
+                std::collections::HashSet::new(),
+            )),
+            Box::new(Type::Func(
+                Box::new(Type::Bool),
+                Box::new(Type::Unit),
+                std::collections::HashSet::new(),
+            )),
+            std::collections::HashSet::new(),
         );
 
         let original_param = Param {
@@ -1859,7 +1925,11 @@ mod tests {
         // Construct a `Type` that exceeds `MAX_TYPE_DEPTH` (16)
         let mut current_type = Type::Int;
         for _ in 0..(MAX_TYPE_DEPTH + 1) {
-            current_type = Type::Func(Box::new(Type::Bool), Box::new(current_type));
+            current_type = Type::Func(
+                Box::new(Type::Bool),
+                Box::new(current_type),
+                std::collections::HashSet::new(),
+            );
         }
 
         let res = encode_type(&current_type);
@@ -2029,7 +2099,11 @@ mod service_code_tests {
         let field_func = interner.insert("f");
 
         let tuple_ty = Type::Tuple(TupleType::new(vec![Type::Int, Type::String]).unwrap());
-        let func_ty = Type::Func(Box::new(Type::Bool), Box::new(Type::Unit));
+        let func_ty = Type::Func(
+            Box::new(Type::Bool),
+            Box::new(Type::Unit),
+            std::collections::HashSet::new(),
+        );
 
         let mut original_type = ServiceType::default();
         original_type.add_field(field_tuple, tuple_ty).unwrap();
@@ -2135,5 +2209,34 @@ mod service_code_tests {
             },
         );
         assert!(validate_lock_request(&invalid_read_map).is_err());
+    }
+
+    /// Verify that `decode_update_service_request` validates service identifiers
+    /// and enforces maximum source length limits
+    #[test]
+    fn test_decode_update_service_request() {
+        let mut interner = Interner::new();
+
+        let valid_res = decode_update_service_request(
+            "MyService",
+            "update MyService { var x = 1; }",
+            &mut interner,
+        );
+        assert!(valid_res.is_ok());
+        let (sym, src) = valid_res.unwrap();
+        assert_eq!(interner.get(sym), "MyService");
+        assert_eq!(src, "update MyService { var x = 1; }");
+
+        let invalid_svc = decode_update_service_request(
+            "invalid-service!",
+            "update invalid-service! {}",
+            &mut interner,
+        );
+        assert!(invalid_svc.is_err());
+
+        let oversized_source = "a".repeat(MAX_NET_REQUEST_SOURCE_LENGTH + 1);
+        let oversized_res =
+            decode_update_service_request("MyService", &oversized_source, &mut interner);
+        assert!(oversized_res.is_err());
     }
 }

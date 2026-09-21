@@ -48,7 +48,6 @@ use crate::runtime::ast::{ActionStmt, BinOp, Decl, Expr, Stmt, UnOp, Value};
 use crate::runtime::interner::Symbol;
 use crate::runtime::tt::types::{Param, ServiceType, TupleType, Type};
 use crate::runtime::Env;
-use std::collections::HashSet;
 
 /// Validate the structural depth of a type representation
 ///
@@ -73,7 +72,7 @@ fn check_type(ty: &Type, depth: usize) -> Result<(), Error> {
             }
             Ok(())
         }
-        Type::Func(t1, t2) => {
+        Type::Func(t1, t2, _) => {
             check_type(t1, depth + 1)?;
             check_type(t2, depth + 1)?;
             Ok(())
@@ -86,33 +85,59 @@ fn check_type(ty: &Type, depth: usize) -> Result<(), Error> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     UnboundVariable(Symbol),
-    TypeMismatch { expected: Type, found: Type },
+    UnknownUpdateTarget(Symbol),
+    TypeMismatch {
+        expected: Box<Type>,
+        found: Box<Type>,
+    },
     CannotInferType,
     DepthLimitExceeded,
     InvalidTupleArity,
     NotAFunction,
+    RecursiveTypeInference {
+        service: Symbol,
+        member: Symbol,
+    },
+    IllegalDependency(Symbol),
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::UnboundVariable(s) => {
-                write!(f, "Unbound variable: {:?}", s)
+                write!(f, "unbound variable: {:?}", s)
+            }
+            Error::UnknownUpdateTarget(s) => {
+                write!(f, "target service '{:?}' for update not found.", s)
             }
             Error::TypeMismatch { expected, found } => {
-                write!(f, "Type mismatch: expected {}, found {}", expected, found)
+                write!(f, "type mismatch: expected {}, found {}.", expected, found)
             }
             Error::CannotInferType => {
-                write!(f, "Cannot infer type")
+                write!(f, "cannot infer type.")
             }
             Error::DepthLimitExceeded => {
-                write!(f, "Depth limit exceeded")
+                write!(f, "depth limit exceeded.")
             }
             Error::InvalidTupleArity => {
-                write!(f, "Invalid tuple arity")
+                write!(f, "invalid tuple arity.")
             }
             Error::NotAFunction => {
-                write!(f, "Not a function")
+                write!(f, "not a function.")
+            }
+            Error::RecursiveTypeInference { service, member } => {
+                write!(
+                    f,
+                    "dependency cycle detected at service '{:?}', member '{:?}'.",
+                    service, member
+                )
+            }
+            Error::IllegalDependency(member) => {
+                write!(
+                    f,
+                    "illegal eager forward reference or dependency cycle on '{:?}'",
+                    member
+                )
             }
         }
     }
@@ -123,12 +148,11 @@ pub struct Context<'a, 'b> {
     depth: usize,
     program: &'a [Stmt],
     /// Type environments for services that are declared locally in this program
-    local_services: &'b mut Env<'a, ServiceType<'a>>,
-    /// Names of services brought in via `import` statements; their member
-    /// types are unknown at compile time and are skipped by the checker
-    import_services: HashSet<Symbol>,
+    local_services: &'b mut Env<'static, ServiceType>,
     checking_stack: Vec<(Symbol, Symbol)>,
     current_service: Option<Symbol>,
+    initialized: std::collections::HashSet<Symbol>,
+    dep_set_stack: Vec<std::collections::HashSet<Symbol>>,
 }
 
 impl<'a, 'b> Context<'a, 'b> {
@@ -136,20 +160,21 @@ impl<'a, 'b> Context<'a, 'b> {
     ///
     /// Args:
     ///     `program` (`&'a [Stmt]`): Slices of parsed statements
-    ///     `local_services` (`&'b mut Env<'a, ServiceType<'a>>`): Mutable
+    ///     `local_services` (`&'b mut Env<'static, ServiceType>`): Mutable
     ///         environment mapping locally-declared service names to their
     ///         accumulated `ServiceType` records
     ///
     /// Returns:
     ///     `Self`: The `Context` instance
-    fn new(program: &'a [Stmt], local_services: &'b mut Env<'a, ServiceType<'a>>) -> Self {
+    fn new(program: &'a [Stmt], local_services: &'b mut Env<'static, ServiceType>) -> Self {
         Self {
             depth: 0,
             program,
             local_services,
-            import_services: HashSet::new(),
             checking_stack: Vec::new(),
             current_service: None,
+            initialized: std::collections::HashSet::new(),
+            dep_set_stack: Vec::new(),
         }
     }
 
@@ -181,21 +206,15 @@ impl<'a, 'b> Context<'a, 'b> {
     /// Returns:
     ///     `Result<(), Error>`: Ok on success
     pub fn check_all(&mut self) -> Result<(), Error> {
-        // First pass: register all locally-declared service names so that
-        // forward-reference lookups within `type_of_member` can find them,
-        // and collect all imported service names so that cross-service member
-        // accesses can be skipped rather than hard-errored
+        // First pass: register all service names (local and imported) so that
+        // forward-reference lookups within `type_of_member` can find them.
+        // Both local and imported Stmt::Service nodes are present in the
+        // unified AST passed from Node::static_checks.
         for stmt in self.program {
-            match stmt {
-                Stmt::Service { name, .. } => {
-                    if self.local_services.find(*name).is_none() {
-                        self.local_services.bind(*name, ServiceType::default());
-                    }
+            if let Stmt::Service { name, .. } = stmt {
+                if self.local_services.find(*name).is_none() {
+                    self.local_services.bind(*name, ServiceType::default());
                 }
-                Stmt::Import { service_name, .. } => {
-                    self.import_services.insert(*service_name);
-                }
-                _ => {}
             }
         }
 
@@ -207,12 +226,6 @@ impl<'a, 'b> Context<'a, 'b> {
 
         for stmt in self.program {
             match stmt {
-                Stmt::Test {
-                    service_name,
-                    stmts,
-                } => {
-                    self.check_test(*service_name, stmts)?;
-                }
                 Stmt::ActionStmt(action) => {
                     let mut local_env = Env::new(None);
                     self.check_action_stmt(action, &mut local_env)?;
@@ -221,23 +234,17 @@ impl<'a, 'b> Context<'a, 'b> {
                     let mut local_env = Env::new(None);
                     self.infer(expr, &mut local_env, 1)?;
                 }
-                Stmt::Update { .. } => {
-                    // TODO(Issue #156): Implement static checks
-                    // (deferred per Issue #34)
-                    println!(
-                        "warning: tt/check: ignoring 'update' \
-                         checks as not yet implemented"
-                    );
+                Stmt::Test {
+                    service_name,
+                    stmts,
+                } => {
+                    self.check_test(*service_name, stmts)?;
                 }
-                Stmt::Import { .. } => {
-                    // TODO(Issue #156): Implement static checks
-                    // (deferred per Issue #34)
-                    println!(
-                        "warning: tt/check: ignoring 'import' \
-                         checks as not yet implemented"
-                    );
-                }
-                Stmt::Connect { .. } | Stmt::Service { .. } => {}
+                Stmt::Connect { .. }
+                | Stmt::Service { .. }
+                | Stmt::Import { .. }
+                | Stmt::Update { .. }
+                | Stmt::Atomic { .. } => {}
             }
         }
 
@@ -277,7 +284,7 @@ impl<'a, 'b> Context<'a, 'b> {
     ///     Result<Type, Error>: The type of the member
     ///
     /// Raises:
-    ///     Error::CannotInferType: On cyclic dependencies
+    ///     Error::DependencyCycle: On cyclic member dependencies
     ///     Error::UnboundVariable: If member is not found
     fn type_of_member(&mut self, service_name: Symbol, member_name: Symbol) -> Result<Type, Error> {
         // Fast path: member type already cached from a prior check
@@ -287,24 +294,35 @@ impl<'a, 'b> Context<'a, 'b> {
             }
         }
 
-        // If the service was brought in via `import`, its declarations are
-        // not present in this compilation unit and cannot be type-checked.
-        // Emit a warning and treat the member as `Unit` (unchecked) so that
-        // the program is not prevented from running
-        if self.import_services.contains(&service_name) {
-            println!(
-                "warning: tt/check: skipping member type check for \
-                 imported service (type unknown at compile time)"
-            );
-            return Ok(Type::UnresolvedService(service_name));
-        }
-
+        // The checking_stack detects mutual type recursion (e.g. `def a
+        // = b; def b = a;`). Execution-order dependencies are analyzed
+        // in a separate compiler pass. This check strictly exists to
+        // ensure type inference terminates and avoids stack overflows.
         let key = (service_name, member_name);
         if self.checking_stack.contains(&key) {
-            return Err(Error::CannotInferType);
+            return Err(Error::RecursiveTypeInference {
+                service: service_name,
+                member: member_name,
+            });
         }
-        self.checking_stack.push(key);
 
+        self.checking_stack.push(key);
+        let prev_service = self.current_service;
+        self.current_service = Some(service_name);
+
+        let res = self.type_of_member_inner(service_name, member_name);
+
+        self.current_service = prev_service;
+        self.checking_stack.pop();
+
+        res
+    }
+
+    fn type_of_member_inner(
+        &mut self,
+        service_name: Symbol,
+        member_name: Symbol,
+    ) -> Result<Type, Error> {
         let decls = self.find_service_decls(service_name)?;
         let decl = decls
             .iter()
@@ -322,35 +340,28 @@ impl<'a, 'b> Context<'a, 'b> {
                 ty: annotated, val, ..
             } => {
                 let mut env = Env::new(None);
-                for prev in decls {
-                    match prev {
-                        Decl::VarDecl { name, .. } | Decl::DefDecl { name, .. } => {
-                            if *name == member_name {
-                                break;
-                            }
-                            let prev_ty = self.type_of_member(service_name, *name)?;
-                            env.bind(*name, prev_ty);
-                        }
-                        Decl::TableDecl { .. } => {}
-                    }
-                }
-
-                let prev_service = self.current_service;
-                self.current_service = Some(service_name);
-                let res = if let Some(expected) = annotated {
+                if let Some(expected) = annotated {
                     check_type(expected, 1)?;
-                    self.check_expr(val, expected, &mut env)?;
-                    expected.clone()
+                    if let Some(mut st) = self.local_services.remove(service_name) {
+                        let _ = st.add_field(member_name, expected.clone());
+                        self.local_services.bind(service_name, st);
+                    }
+                    match self.check_expr(val, expected, &mut env) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            if let Some(mut st) = self.local_services.remove(service_name) {
+                                st.remove_field(member_name);
+                                self.local_services.bind(service_name, st);
+                            }
+                            return Err(e);
+                        }
+                    }
                 } else {
                     self.infer(val, &mut env, 1)?
-                };
-                self.current_service = prev_service;
-                res
+                }
             }
             Decl::TableDecl { .. } => Type::Unit,
         };
-
-        self.checking_stack.pop();
 
         if let Some(mut st) = self.local_services.remove(service_name) {
             let _ = st.add_field(member_name, ty.clone());
@@ -373,8 +384,10 @@ impl<'a, 'b> Context<'a, 'b> {
             match decl {
                 Decl::VarDecl { name, .. } | Decl::DefDecl { name, .. } => {
                     self.type_of_member(service_name, *name)?;
+                    self.initialized.insert(*name);
                 }
-                Decl::TableDecl { .. } => {
+                Decl::TableDecl { name, .. } => {
+                    self.initialized.insert(*name);
                     // TODO(Issue #156): Implement Table type schema
                     // validation (deferred per Issue #34)
                     println!(
@@ -432,8 +445,8 @@ impl<'a, 'b> Context<'a, 'b> {
             ActionStmt::Let { name, ty, expr } => {
                 if let Some(expected) = ty {
                     check_type(expected, 1)?;
-                    self.check_expr(expr, expected, env)?;
-                    env.bind(*name, expected.clone());
+                    let actual_ty = self.check_expr(expr, expected, env)?;
+                    env.bind(*name, actual_ty);
                 } else {
                     let inferred = self.infer(expr, env, 1)?;
                     env.bind(*name, inferred);
@@ -456,14 +469,7 @@ impl<'a, 'b> Context<'a, 'b> {
                 let ty = if let Some(local_ty) = env.find(*name) {
                     local_ty.clone()
                 } else if let Some(svc) = self.current_service {
-                    if let Some(st) = self.local_services.find(svc) {
-                        st.fields()
-                            .find(*name)
-                            .ok_or(Error::UnboundVariable(*name))?
-                            .clone()
-                    } else {
-                        return Err(Error::UnboundVariable(*name));
-                    }
+                    self.type_of_member(svc, *name)?
                 } else {
                     return Err(Error::UnboundVariable(*name));
                 };
@@ -495,8 +501,8 @@ impl<'a, 'b> Context<'a, 'b> {
                     Ok(())
                 } else {
                     Err(Error::TypeMismatch {
-                        expected: Type::List(Box::new(Type::Unit)),
-                        found: iter_ty,
+                        expected: Box::new(Type::List(Box::new(Type::Unit))),
+                        found: Box::new(iter_ty),
                     })
                 }
             }
@@ -519,27 +525,29 @@ impl<'a, 'b> Context<'a, 'b> {
         expr: &Expr,
         expected: &Type,
         env: &mut Env<'_, Type>,
-    ) -> Result<(), Error> {
+    ) -> Result<Type, Error> {
         self.inc_depth()?;
         let res = match (expr, expected) {
             (Expr::Tuple { val }, Type::Tuple(tuple_ty)) => {
                 if val.len() != tuple_ty.len() {
                     return Err(Error::InvalidTupleArity);
                 }
+                let mut actual_types = Vec::new();
                 for (i, elem) in val.iter().enumerate() {
-                    self.check_expr(elem, &tuple_ty[i], env)?;
+                    actual_types.push(self.check_expr(elem, &tuple_ty[i], env)?);
                 }
-                Ok(())
+                let actual_tuple = TupleType::new(actual_types).unwrap();
+                Ok(Type::Tuple(actual_tuple))
             }
             (Expr::Tuple { val }, Type::Unit) => {
                 if val.is_empty() {
-                    Ok(())
+                    Ok(Type::Unit)
                 } else {
                     let types = val.iter().map(|_| Type::Unit).collect();
                     let tuple_ty = TupleType::new(types).map_err(|_| Error::InvalidTupleArity)?;
                     Err(Error::TypeMismatch {
-                        expected: Type::Unit,
-                        found: Type::Tuple(tuple_ty),
+                        expected: Box::new(Type::Unit),
+                        found: Box::new(Type::Tuple(tuple_ty)),
                     })
                 }
             }
@@ -547,7 +555,7 @@ impl<'a, 'b> Context<'a, 'b> {
                 for elem in elems {
                     self.check_expr(elem, inner, env)?;
                 }
-                Ok(())
+                Ok(Type::List(inner.clone()))
             }
             (
                 Expr::Func {
@@ -555,13 +563,13 @@ impl<'a, 'b> Context<'a, 'b> {
                     body,
                     return_ty,
                 },
-                Type::Func(expected_param, expected_ret),
+                Type::Func(expected_param, expected_ret, _expected_deps),
             ) => {
                 if let Some(ret_ty) = return_ty {
                     if ret_ty != expected_ret.as_ref() {
                         return Err(Error::TypeMismatch {
-                            expected: (**expected_ret).clone(),
-                            found: ret_ty.clone(),
+                            expected: Box::new((**expected_ret).clone()),
+                            found: Box::new(ret_ty.clone()),
                         });
                     }
                 }
@@ -569,16 +577,16 @@ impl<'a, 'b> Context<'a, 'b> {
                 if params.is_empty() {
                     if **expected_param != Type::Unit {
                         return Err(Error::TypeMismatch {
-                            expected: (**expected_param).clone(),
-                            found: Type::Unit,
+                            expected: Box::new((**expected_param).clone()),
+                            found: Box::new(Type::Unit),
                         });
                     }
                 } else if params.len() == 1 {
                     if let Some(param_ty) = &params[0].ty {
                         if param_ty != expected_param.as_ref() {
                             return Err(Error::TypeMismatch {
-                                expected: (**expected_param).clone(),
-                                found: param_ty.clone(),
+                                expected: Box::new((**expected_param).clone()),
+                                found: Box::new(param_ty.clone()),
                             });
                         }
                     }
@@ -591,8 +599,8 @@ impl<'a, 'b> Context<'a, 'b> {
                         if let Some(param_ty) = &param.ty {
                             if param_ty != &ts[i] {
                                 return Err(Error::TypeMismatch {
-                                    expected: ts[i].clone(),
-                                    found: param_ty.clone(),
+                                    expected: Box::new(ts[i].clone()),
+                                    found: Box::new(param_ty.clone()),
                                 });
                             }
                         }
@@ -602,25 +610,37 @@ impl<'a, 'b> Context<'a, 'b> {
                     let types = params.iter().map(|_| Type::Unit).collect();
                     let tuple_ty = TupleType::new(types).map_err(|_| Error::InvalidTupleArity)?;
                     return Err(Error::TypeMismatch {
-                        expected: (**expected_param).clone(),
-                        found: Type::Tuple(tuple_ty),
+                        expected: Box::new((**expected_param).clone()),
+                        found: Box::new(Type::Tuple(tuple_ty)),
                     });
                 }
-                self.check_expr(body, expected_ret, &mut local_env)?;
-                Ok(())
+                self.dep_set_stack.push(std::collections::HashSet::new());
+                let actual_ret = self.check_expr(body, expected_ret, &mut local_env)?;
+                let deps = self.dep_set_stack.pop().unwrap();
+                Ok(Type::Func(
+                    expected_param.clone(),
+                    Box::new(actual_ret),
+                    deps,
+                ))
             }
             (Expr::Action(stmts), Type::Unit) => {
                 let mut action_env = Env::new(Some(env));
+                self.dep_set_stack.push(std::collections::HashSet::new());
+                let mut result = Ok(Type::Unit);
                 for stmt in stmts {
-                    self.check_action_stmt(stmt, &mut action_env)?;
+                    if let Err(e) = self.check_action_stmt(stmt, &mut action_env) {
+                        result = Err(e);
+                        break;
+                    }
                 }
-                Ok(())
+                self.dep_set_stack.pop().unwrap();
+                result
             }
             (Expr::If { cond, expr1, expr2 }, _) => {
                 self.check_expr(cond, &Type::Bool, env)?;
-                self.check_expr(expr1, expected, env)?;
+                let ty1 = self.check_expr(expr1, expected, env)?;
                 self.check_expr(expr2, expected, env)?;
-                Ok(())
+                Ok(ty1)
             }
             (e, t) => {
                 let inferred = self.infer(e, env, 1)?;
@@ -631,11 +651,11 @@ impl<'a, 'b> Context<'a, 'b> {
                     || matches!(inferred, Type::UnresolvedService(_))
                     || matches!(t, Type::UnresolvedService(_))
                 {
-                    Ok(())
+                    Ok(inferred)
                 } else {
                     Err(Error::TypeMismatch {
-                        expected: t.clone(),
-                        found: inferred,
+                        expected: Box::new(t.clone()),
+                        found: Box::new(inferred),
                     })
                 }
             }
@@ -691,6 +711,14 @@ impl<'a, 'b> Context<'a, 'b> {
                     Ok(ty.clone())
                 } else if let Some(svc) = self.current_service {
                     let ty = self.type_of_member(svc, *name)?;
+                    if let Some(deps) = self.dep_set_stack.last_mut() {
+                        deps.insert(*name);
+                        if let Type::Func(_, _, ref func_deps) = ty {
+                            deps.extend(func_deps.iter().copied());
+                        }
+                    } else if !self.initialized.contains(name) {
+                        return Err(Error::IllegalDependency(*name));
+                    }
                     Ok(ty)
                 } else {
                     Err(Error::UnboundVariable(*name))
@@ -756,43 +784,80 @@ impl<'a, 'b> Context<'a, 'b> {
             } => self.infer_function_type(params, body, return_ty.as_ref(), env, type_depth),
             Expr::Call { func, args } => {
                 let func_ty = self.infer(func, env, type_depth)?;
-                if let Type::Func(param_ty, ret_ty) = func_ty {
+                if let Type::Func(param_ty, ret_ty, func_deps) = func_ty {
+                    if let Some(deps) = self.dep_set_stack.last_mut() {
+                        deps.extend(func_deps.iter().copied());
+                    } else {
+                        for dep in &func_deps {
+                            if !self.initialized.contains(dep) {
+                                return Err(Error::IllegalDependency(*dep));
+                            }
+                        }
+                    }
+                    let mut re_ty_opt = None;
                     if args.is_empty() {
                         if *param_ty != Type::Unit {
                             return Err(Error::TypeMismatch {
-                                expected: *param_ty,
-                                found: Type::Unit,
+                                expected: Box::new((*param_ty).clone()),
+                                found: Box::new(Type::Unit),
                             });
                         }
                     } else if args.len() == 1 {
-                        self.check_expr(&args[0], &param_ty, env)?;
+                        let actual_arg_ty = self.check_expr(&args[0], &param_ty, env)?;
+                        if self.type_has_deps(&actual_arg_ty) {
+                            re_ty_opt = self.contextual_re_inference(
+                                func,
+                                &[actual_arg_ty],
+                                env,
+                                type_depth,
+                            )?;
+                        }
                     } else if let Type::Tuple(ts) = &*param_ty {
                         if args.len() != ts.len() {
                             return Err(Error::InvalidTupleArity);
                         }
+                        let mut actual_arg_types = Vec::new();
                         for (i, arg) in args.iter().enumerate() {
-                            self.check_expr(arg, &ts[i], env)?;
+                            actual_arg_types.push(self.check_expr(arg, &ts[i], env)?);
+                        }
+                        if actual_arg_types.iter().any(|ty| self.type_has_deps(ty)) {
+                            re_ty_opt = self.contextual_re_inference(
+                                func,
+                                &actual_arg_types,
+                                env,
+                                type_depth,
+                            )?;
                         }
                     } else {
                         let types = args.iter().map(|_| Type::Unit).collect();
                         let tuple_ty =
                             TupleType::new(types).map_err(|_| Error::InvalidTupleArity)?;
                         return Err(Error::TypeMismatch {
-                            expected: *param_ty,
-                            found: Type::Tuple(tuple_ty),
+                            expected: Box::new((*param_ty).clone()),
+                            found: Box::new(Type::Tuple(tuple_ty)),
                         });
                     }
-                    Ok(*ret_ty)
+                    if let Some(re_ty) = re_ty_opt {
+                        Ok(re_ty)
+                    } else {
+                        Ok(*ret_ty)
+                    }
                 } else {
                     Err(Error::NotAFunction)
                 }
             }
             Expr::Action(stmts) => {
                 let mut action_env = Env::new(Some(env));
+                self.dep_set_stack.push(std::collections::HashSet::new());
+                let mut result = Ok(Type::Unit);
                 for stmt in stmts {
-                    self.check_action_stmt(stmt, &mut action_env)?;
+                    if let Err(e) = self.check_action_stmt(stmt, &mut action_env) {
+                        result = Err(e);
+                        break;
+                    }
                 }
-                Ok(Type::Unit)
+                self.dep_set_stack.pop().unwrap();
+                result
             }
             Expr::MemberAccess {
                 service_name,
@@ -846,6 +911,7 @@ impl<'a, 'b> Context<'a, 'b> {
         type_depth: usize,
     ) -> Result<Type, Error> {
         let mut local_env = Env::new(Some(env));
+        self.dep_set_stack.push(std::collections::HashSet::new());
         let mut param_types = Vec::new();
         for param in params {
             if let Some(p_ty) = &param.ty {
@@ -866,12 +932,12 @@ impl<'a, 'b> Context<'a, 'b> {
         check_type(&p_ty, type_depth + 1)?;
         let r_ty = if let Some(annotated_ret) = return_ty {
             check_type(annotated_ret, type_depth + 1)?;
-            self.check_expr(body, annotated_ret, &mut local_env)?;
-            annotated_ret.clone()
+            self.check_expr(body, annotated_ret, &mut local_env)?
         } else {
             self.infer(body, &mut local_env, type_depth + 1)?
         };
-        Ok(Type::Func(Box::new(p_ty), Box::new(r_ty)))
+        let deps = self.dep_set_stack.pop().unwrap();
+        Ok(Type::Func(Box::new(p_ty), Box::new(r_ty), deps))
     }
 
     /// Helper to infer type from Value literals directly
@@ -900,8 +966,8 @@ impl<'a, 'b> Context<'a, 'b> {
                         let v_ty = Self::infer_value(v, type_depth + 1)?;
                         if v_ty != inner {
                             return Err(Error::TypeMismatch {
-                                expected: inner,
-                                found: v_ty,
+                                expected: Box::new(inner),
+                                found: Box::new(v_ty),
                             });
                         }
                     }
@@ -939,6 +1005,7 @@ impl<'a, 'b> Context<'a, 'b> {
                     Ok(Type::Func(
                         Box::new(expected_param),
                         Box::new(ret_ty.clone()),
+                        std::collections::HashSet::new(),
                     ))
                 } else {
                     Err(Error::CannotInferType)
@@ -946,13 +1013,117 @@ impl<'a, 'b> Context<'a, 'b> {
             }
         }
     }
+
+    fn type_has_deps(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Func(_, _, deps) => !deps.is_empty(),
+            Type::List(inner) => self.type_has_deps(inner),
+            Type::Tuple(ts) => ts.iter().any(|t| self.type_has_deps(t)),
+            _ => false,
+        }
+    }
+
+    fn contextual_re_inference(
+        &mut self,
+        func: &Expr,
+        arg_types: &[Type],
+        env: &Env<'_, Type>,
+        type_depth: usize,
+    ) -> Result<Option<Type>, Error> {
+        let (params, body) = match func {
+            Expr::Func { params, body, .. } => (params.clone(), (**body).clone()),
+            Expr::Variable { name } => {
+                if env.find(*name).is_some() {
+                    return Ok(None);
+                } else if let Some(svc) = self.current_service {
+                    let decls = match self.find_service_decls(svc) {
+                        Ok(d) => d,
+                        Err(_) => return Ok(None),
+                    };
+                    let decl = match decls.iter().find(|d| match d {
+                        Decl::VarDecl { name: n, .. } | Decl::DefDecl { name: n, .. } => {
+                            *n == *name
+                        }
+                        Decl::TableDecl { name: n, .. } => *n == *name,
+                    }) {
+                        Some(d) => d,
+                        None => return Ok(None),
+                    };
+                    let val = match decl {
+                        Decl::VarDecl { val, .. } | Decl::DefDecl { val, .. } => val,
+                        _ => return Ok(None),
+                    };
+                    if let Expr::Func { params, body, .. } = val {
+                        (params.clone(), (**body).clone())
+                    } else {
+                        return Ok(None);
+                    }
+                } else {
+                    return Ok(None);
+                }
+            }
+            Expr::MemberAccess {
+                service_name,
+                member_name,
+            } => {
+                let decls = match self.find_service_decls(*service_name) {
+                    Ok(d) => d,
+                    Err(_) => return Ok(None),
+                };
+                let decl = match decls.iter().find(|d| match d {
+                    Decl::VarDecl { name: n, .. } | Decl::DefDecl { name: n, .. } => {
+                        *n == *member_name
+                    }
+                    Decl::TableDecl { name: n, .. } => *n == *member_name,
+                }) {
+                    Some(d) => d,
+                    None => return Ok(None),
+                };
+                let val = match decl {
+                    Decl::VarDecl { val, .. } | Decl::DefDecl { val, .. } => val,
+                    _ => return Ok(None),
+                };
+                if let Expr::Func { params, body, .. } = val {
+                    (params.clone(), (**body).clone())
+                } else {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
+        };
+
+        let mut re_env = Env::new(Some(env));
+        if params.len() == arg_types.len() {
+            for (i, param) in params.iter().enumerate() {
+                re_env.bind(param.name, arg_types[i].clone());
+            }
+        } else if arg_types.len() == 1 {
+            if let Type::Tuple(ts) = &arg_types[0] {
+                if params.len() == ts.len() {
+                    for (i, param) in params.iter().enumerate() {
+                        re_env.bind(param.name, ts[i].clone());
+                    }
+                }
+            }
+        }
+
+        let prev_service = self.current_service;
+        if let Expr::MemberAccess { service_name, .. } = func {
+            self.current_service = Some(*service_name);
+        }
+
+        let res = self.infer(&body, &mut re_env, type_depth + 1)?;
+        self.current_service = prev_service;
+
+        Ok(Some(res))
+    }
 }
 
-/// Type check the entire parsed program and populate local service types
+/// Perform static type checking on a program statement list
 ///
 /// Args:
 ///     `program` (`&[Stmt]`): Slices of parsed statements
-///     `local_services` (`&mut Env<'_, ServiceType<'_>>`): Mutable
+///     `local_services` (`&mut Env<'static, ServiceType>`): Mutable
 ///         environment that accumulates type information for each
 ///         locally-declared service; imported services are skipped
 ///
@@ -961,9 +1132,9 @@ impl<'a, 'b> Context<'a, 'b> {
 ///
 /// Raises:
 ///     `Error`: Any type error encountered during resolution
-pub fn check<'a>(
-    program: &'a [Stmt],
-    local_services: &mut Env<'a, ServiceType<'a>>,
+pub fn check(
+    program: &[Stmt],
+    local_services: &mut Env<'static, ServiceType>,
 ) -> Result<(), Error> {
     let mut context = Context::new(program, local_services);
     context.check_all()

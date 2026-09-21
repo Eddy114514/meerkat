@@ -22,7 +22,7 @@ use crate::runtime::limits::MAX_IDENTIFIER_LENGTH;
 /// The inner field `id` is private to the module to prevent arbitrary
 /// construction of `Symbol` outside of the `interner` module, enforcing
 /// that symbols can only be created by `Interner` or sentinel constructors
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Symbol {
     id: u32,
 }
@@ -40,22 +40,6 @@ impl std::fmt::Debug for Symbol {
     ///     `std::fmt::Result`: The result of the formatting operation
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Symbol({})", self.id)
-    }
-}
-
-/// Implement the `Display` trait for the `Symbol` struct
-///
-/// This outputs the raw integer ID of the symbol for standard display formatting
-impl std::fmt::Display for Symbol {
-    /// Format the symbol for user display
-    ///
-    /// Args:
-    ///     `f` (`&mut std::fmt::Formatter<'_>`): The formatter target
-    ///
-    /// Returns:
-    ///     `std::fmt::Result`: The result of the formatting operation
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.id)
     }
 }
 
@@ -86,6 +70,7 @@ impl Symbol {
 }
 
 /// A string interner that maps strings to unique `Symbol`s
+#[derive(Clone)]
 pub struct Interner {
     index: HashMap<String, u32>,
     strings: Vec<String>,
@@ -241,13 +226,6 @@ mod tests {
     fn test_interner_default() {
         let interner = Interner::default();
         assert_eq!(interner.get(Symbol::empty()), "");
-    }
-
-    /// Verify that Symbol implements Display correctly
-    #[test]
-    fn test_symbol_display_format() {
-        let symbol = Symbol { id: 100 };
-        assert_eq!(format!("{}", symbol), "100");
     }
 
     /// Verify Symbol PartialEq, Eq, and Hash properties
