@@ -1430,9 +1430,7 @@ impl Manager {
                 self.interner.get(service)
             ))
         })?;
-        let service_str = self.interner.get(service);
-        let addr_str = full_url.0.trim_end_matches(&format!("/{}", service_str));
-        Ok(Address::new(addr_str))
+        Ok(full_url.node_address(self.interner.get(service)))
     }
 
     /// Get our local address with peer ID for use as reply_to

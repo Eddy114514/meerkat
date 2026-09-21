@@ -46,19 +46,7 @@ struct ImportedModule {
     /// network. That peer runs the file as its own program, so it serves
     /// every service the file declares -- not only the one that was asked
     /// for. `None` for a file read from local disk, which this node serves.
-    remote_peer: Option<String>,
-}
-
-/// Strip the service slug from an import URL, leaving the peer address.
-///
-/// `-i` URLs end with the slug of the service they serve
-/// (`meerkat/src/main.rs` derives the slug from exactly that segment), and
-/// `Manager::remote_addr` strips it again to dial the peer. Removing it here
-/// lets a sibling service's URL be built against the same peer.
-fn peer_address(url: &str, service_name: &str) -> String {
-    url.strip_suffix(&format!("/{}", service_name))
-        .unwrap_or(url)
-        .to_string()
+    remote_peer: Option<Address>,
 }
 
 /// State machine for resolving module import dependencies
@@ -216,7 +204,7 @@ impl<'a> Imports<'a> {
         let remote_peer = self
             .remote_url_map
             .get(service_name)
-            .map(|url| peer_address(url, service_name));
+            .map(|url| Address::new(url.as_str()).node_address(service_name));
 
         self.record_source(source, base_dir, remote_peer)
     }
@@ -243,7 +231,7 @@ impl<'a> Imports<'a> {
         &mut self,
         source: &str,
         base_dir: &Path,
-        remote_peer: Option<String>,
+        remote_peer: Option<Address>,
     ) -> Result<Vec<ImportCommand>> {
         if self.visited_services.len() >= MAX_IMPORTED_SERVICES {
             return Err(Error::LimitExceeded(format!(
@@ -504,7 +492,7 @@ impl<'a> Imports<'a> {
             if let Some(peer) = &module.remote_peer {
                 for declared in &module.declares {
                     let name = self.interner.get(*declared).to_string();
-                    let url = format!("{}/{}", peer, name);
+                    let url = format!("{}/{}", peer.0, name);
                     owners.insert(name, url);
                 }
             }
