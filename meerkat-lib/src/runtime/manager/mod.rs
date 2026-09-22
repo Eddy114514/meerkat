@@ -115,6 +115,19 @@ pub struct Manager {
     pub local_services: Env<'static, ServiceType>,
 }
 
+/// The names of the services a program declares itself.
+///
+/// These are served locally, so an `-i` flag naming one of them is never
+/// honoured: see `Manager::register_remote_services`.
+pub fn local_service_names(prog: &[Stmt]) -> HashSet<Symbol> {
+    prog.iter()
+        .filter_map(|s| match s {
+            Stmt::Service { name, .. } => Some(*name),
+            _ => None,
+        })
+        .collect()
+}
+
 impl Manager {
     pub fn new(interner: Interner) -> Self {
         Manager {
@@ -243,6 +256,99 @@ impl Manager {
                 // changes mid-run
                 ServiceNetId::new(name_str)
             }
+        }
+    }
+
+    /// Register the parsed `-i <url>` mappings, then instantiate every locally
+    /// resolved import. Steps 1-3 of CLI startup; the caller then creates the
+    /// services the program declares itself, in program order.
+    ///
+    /// Shared by every entry point that starts a node from a parsed program, so
+    /// the ordering below is established once rather than re-derived per
+    /// caller. `unified_ast` must already be set.
+    ///
+    /// `remote_url_map` maps a service slug to the address serving it. The CLI
+    /// builds it from repeated `-i <url>` flags, taking the slug from each
+    /// URL's final path segment (`meerkat/src/main.rs`).
+    ///
+    /// Errors:
+    ///   `EvalError`: If instantiating an imported service fails
+    pub async fn register_and_instantiate_imports(
+        &mut self,
+        prog: &[Stmt],
+        remote_url_map: &HashMap<String, String>,
+    ) -> Result<(), EvalError> {
+        // Services declared by this program itself. An import must not
+        // instantiate these: the caller creates them from `prog`.
+        let local = local_service_names(prog);
+
+        // Register every configured remote service up front, before any import
+        // is processed. Doing it lazily as each root `Stmt::Import` is reached
+        // makes instantiation order-dependent: an earlier local import walks
+        // the whole unified AST, and a remote service it finds there would be
+        // built locally as a phantom copy. A remote service reached only
+        // transitively has no root `Stmt::Import` at all, so it would never be
+        // registered and every read and action would silently target that local
+        // copy instead of the owning node.
+        self.register_remote_services(remote_url_map, &local);
+
+        // Instantiate every locally resolved import before any of this
+        // program's own services, in `unified_ast` order (which is dependency
+        // order). The grammar allows `import` to appear after the service that
+        // uses it, and static checks accept that because the unified AST is
+        // reordered, so creating imports only when their `Stmt::Import` is
+        // reached would build `app` before the `dep` it reads and fail with
+        // `ServiceNotFound`.
+        let imported: Vec<(Symbol, Vec<Decl>)> = self
+            .unified_ast
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Service { name, decls } => Some((*name, decls.clone())),
+                _ => None,
+            })
+            .filter(|(name, _)| !local.contains(name) && !self.remote_services.contains_key(name))
+            .collect();
+        for (name, decls) in imported {
+            if self.services.contains_key(&name) {
+                continue;
+            }
+            self.create_service(name, decls).await?;
+            println!("Imported service '{}'", self.interner.get(name));
+        }
+        Ok(())
+    }
+
+    /// Record each entry of `remote_url_map` -- service slug to the address
+    /// serving it -- in `remote_services`.
+    ///
+    /// The CLI builds that map from repeated `-i <url>` flags, taking the slug
+    /// from each URL's final path segment (`meerkat/src/main.rs`); a slug is
+    /// therefore whatever the URL happens to end with, not something the user
+    /// states outright.
+    ///
+    /// A service this program declares itself is never registered as remote,
+    /// whatever `-i` says. `lookup` consults `remote_services` before anything
+    /// local, so a slug collision would otherwise route a locally declared
+    /// service's reads and writes to a peer and leave the local copy
+    /// unreachable. Since the slug is implicit, such a collision is easy to
+    /// hit by accident, so it is reported rather than quietly dropped.
+    pub fn register_remote_services(
+        &mut self,
+        remote_url_map: &HashMap<String, String>,
+        local: &HashSet<Symbol>,
+    ) {
+        for (svc, url) in remote_url_map {
+            let sym = self.interner.insert(svc);
+            if local.contains(&sym) {
+                println!(
+                    "Warning: ignoring '-i {}': '{}' is declared by this program \
+                     and is served locally",
+                    url, svc
+                );
+                continue;
+            }
+            self.remote_services.insert(sym, Address::new(url.as_str()));
+            println!("Remote service '{}' registered at {}", svc, url);
         }
     }
 
@@ -1324,9 +1430,7 @@ impl Manager {
                 self.interner.get(service)
             ))
         })?;
-        let service_str = self.interner.get(service);
-        let addr_str = full_url.0.trim_end_matches(&format!("/{}", service_str));
-        Ok(Address::new(addr_str))
+        Ok(full_url.node_address(self.interner.get(service)))
     }
 
     /// Get our local address with peer ID for use as reply_to
@@ -2979,6 +3083,158 @@ mod tests {
             tc.manager.reactive_cache,
             Some(outer),
             "a nested recompute must hand the outer cache back untouched"
+        );
+    }
+
+    /// Build `service <name> { var x = <val>; }`.
+    fn service_stmt(interner: &mut Interner, name: &str, val: i32) -> Stmt {
+        Stmt::Service {
+            name: interner.insert(name),
+            decls: vec![Decl::VarDecl {
+                name: interner.insert("x"),
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val },
+                },
+            }],
+        }
+    }
+
+    /// `local_service_names` reports declarations and nothing else.
+    #[test]
+    fn local_service_names_covers_declarations_only() {
+        let mut interner = Interner::new();
+        let app = interner.insert("app");
+        let dep = interner.insert("dep");
+        let prog = vec![
+            Stmt::Import {
+                path: "dep.mkt".to_string(),
+                service_name: dep,
+            },
+            service_stmt(&mut interner, "app", 0),
+        ];
+
+        let names = local_service_names(&prog);
+
+        assert!(names.contains(&app));
+        assert!(
+            !names.contains(&dep),
+            "an `import` is a reference, not a declaration: counting it would \
+             suppress the `-i` flag that resolves it"
+        );
+    }
+
+    /// An `-i` flag naming a service this program declares must be refused.
+    ///
+    /// `lookup` consults `remote_services` before anything local, so
+    /// registering it would route the locally declared service's reads and
+    /// writes to a peer and leave the local copy permanently unreachable.
+    #[test]
+    fn register_remote_services_skips_locally_declared_services() {
+        let mut manager = Manager::default();
+        let prog = vec![service_stmt(&mut manager.interner, "s2", 0)];
+        let local = local_service_names(&prog);
+        let mut urls = HashMap::new();
+        urls.insert("s2".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+        urls.insert("s9".to_string(), "/ip4/127.0.0.1/tcp/9001".to_string());
+
+        manager.register_remote_services(&urls, &local);
+
+        let s2 = manager.interner.insert("s2");
+        let s9 = manager.interner.insert("s9");
+        assert!(
+            !manager.remote_services.contains_key(&s2),
+            "a locally declared service must never be registered as remote"
+        );
+        assert!(
+            manager.remote_services.contains_key(&s9),
+            "an unrelated -i flag must still be honoured"
+        );
+    }
+
+    /// Imports are instantiated from `unified_ast`, before the program's own
+    /// services and in dependency order.
+    #[tokio::test]
+    async fn register_and_instantiate_imports_builds_imported_services() {
+        let mut manager = Manager::default();
+        let dep = service_stmt(&mut manager.interner, "dep", 7);
+        let app = service_stmt(&mut manager.interner, "app", 1);
+        let prog = vec![app.clone()];
+        manager.unified_ast = vec![dep, app];
+
+        manager
+            .register_and_instantiate_imports(&prog, &HashMap::new())
+            .await
+            .expect("imports instantiate");
+
+        let dep_sym = manager.interner.insert("dep");
+        let app_sym = manager.interner.insert("app");
+        assert!(
+            manager.services.contains_key(&dep_sym),
+            "a locally resolved import must be instantiated"
+        );
+        assert!(
+            !manager.services.contains_key(&app_sym),
+            "the program's own services are created by the caller, in program order"
+        );
+    }
+
+    /// An unrelated `-i` flag must not stop local imports being instantiated.
+    ///
+    /// `run_server` used to be handed `prog` instead of the unified AST
+    /// whenever any `-i` flag was present, which silently dropped every
+    /// locally resolved import in exactly the configuration that mixes local
+    /// and remote services.
+    #[tokio::test]
+    async fn register_and_instantiate_imports_survives_an_unrelated_remote_flag() {
+        let mut manager = Manager::default();
+        let dep = service_stmt(&mut manager.interner, "dep", 7);
+        let app = service_stmt(&mut manager.interner, "app", 1);
+        let prog = vec![app.clone()];
+        manager.unified_ast = vec![dep, app];
+        let mut urls = HashMap::new();
+        urls.insert("far".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+
+        manager
+            .register_and_instantiate_imports(&prog, &urls)
+            .await
+            .expect("imports instantiate");
+
+        let dep_sym = manager.interner.insert("dep");
+        assert!(
+            manager.services.contains_key(&dep_sym),
+            "an unrelated -i flag must not suppress local imports"
+        );
+    }
+
+    /// A service resolved remotely must not also be built locally.
+    ///
+    /// It appears in `unified_ast` because its source was fetched for type
+    /// checking, but the owning node serves it; a local copy would shadow the
+    /// peer, since `lookup` prefers `remote_services`.
+    #[tokio::test]
+    async fn register_and_instantiate_imports_skips_remote_services() {
+        let mut manager = Manager::default();
+        let dep = service_stmt(&mut manager.interner, "dep", 7);
+        let app = service_stmt(&mut manager.interner, "app", 1);
+        let prog = vec![app.clone()];
+        manager.unified_ast = vec![dep, app];
+        let mut urls = HashMap::new();
+        urls.insert("dep".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+
+        manager
+            .register_and_instantiate_imports(&prog, &urls)
+            .await
+            .expect("imports instantiate");
+
+        let dep_sym = manager.interner.insert("dep");
+        assert!(
+            manager.remote_services.contains_key(&dep_sym),
+            "the -i flag must be honoured"
+        );
+        assert!(
+            !manager.services.contains_key(&dep_sym),
+            "a remotely served service must not be built as a local phantom copy"
         );
     }
 
