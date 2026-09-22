@@ -57,16 +57,31 @@ self.send_commit(...)`, ~line 2166) — the line this task removes.
 Decide explicitly rather than by default, and record the reasoning in the PR:
 
 - **Route it through `remote_error`** and a `WaitDieAbort` raised beneath a
-  participant's commit is preserved, and becomes retryable like any other.
-- **Leave it flattened** to `LocalDispatchFailed` and a refused commit stays
-  terminal.
+  participant's commit is preserved as that variant rather than flattened.
+- **Leave it flattened** to `LocalDispatchFailed` and every refused commit
+  arrives as one terminal kind.
 
-The default is to leave it flattened, for this task's own reason about #191:
-the writes above the failure are already durable, so committing is not the
-safe, idempotent operation an action is. Preserving the variant would feed a
-partially committed transaction back into the wait-die retry budget. If that
-reasoning turns out to be wrong it is a one-line change — which is the point
-of having `remote_error` in one place.
+Note first what the control flow does *not* do, since the choice is easy to
+misread as being about retries. The wait-die retry branch is gated on
+`exec_error` — the failure of a *statement*, set before the commit loop is
+reached — and it is the only path that loops. A failure recorded in the commit
+loop is handed to the unconditional `return` that follows, so it cannot
+re-enter the retry budget. Nor can it do so on another node:
+`execute_action_with_txn` runs only on the originator, because a participant
+serving a remote action goes through `execute_action_participant`, which has no
+retry loop. Either choice here changes what the failure is *called*, not
+whether the action runs again.
+
+The default is to leave it flattened, and the reason is what the name claims
+rather than what the loop does. `remote_error` exists to preserve one
+distinction — that a failure is routine contention, safe to retry — and
+`WaitDieAbort` is the variant carrying it. A refused commit is not safe to
+retry: the writes above it are already durable (#191). Labelling it
+`WaitDieAbort` would put that false claim into the one variant whose whole
+meaning is retry-safety, where anything keying off it later would believe it —
+and task 06 adds more machinery keyed off exactly that variant. If the
+reasoning turns out to be wrong it is a one-line change, which is the point of
+having `remote_error` in one place.
 
 ## Tests
 
@@ -108,4 +123,10 @@ downward forward fails must still store, still propagate, still free its locks,
     struct change: it relocates the mixed-version hazard from "misread as
     terminal" to "message fails to decode" rather than removing it.
 
-  Revisit if a third consumer appears, or when protocol versioning does.
+  Revisit when a **second `EvalError` variant has to survive the wire as
+  itself**. Today exactly one does — `WaitDieAbort` — and everything else is
+  deliberately flattened to `LocalDispatchFailed`; task 06 does not add one,
+  since it converts an escaping `WaitOn` into a `WaitDieAbort` before it
+  leaves. The call-site count is not the trigger: `remote_error` gaining a
+  fourth call site above changes nothing, because all four discriminate the
+  same single variant. Revisit also when protocol versioning arrives.
