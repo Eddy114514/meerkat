@@ -45,6 +45,29 @@ keeps going (every participant still needs its `Commit`), then still runs
 `propagate_committed_writes`, and finally returns the recorded error in place of
 `Ok(())`.
 
+### The originator's side of a refused commit
+
+`send_commit` reconstructs an `EvalError` from `CommitResponse`'s `error`
+string (~line 2643 on `main`). It is the fourth such site in `manager/mod.rs`;
+task 05 routed the other three through `Manager::remote_error`, and both that
+task's spec and the reference branch missed this one. It only starts to matter
+here, because `execute_action_with_txn` discards its result today (`let _ =
+self.send_commit(...)`, ~line 2166) — the line this task removes.
+
+Decide explicitly rather than by default, and record the reasoning in the PR:
+
+- **Route it through `remote_error`** and a `WaitDieAbort` raised beneath a
+  participant's commit is preserved, and becomes retryable like any other.
+- **Leave it flattened** to `LocalDispatchFailed` and a refused commit stays
+  terminal.
+
+The default is to leave it flattened, for this task's own reason about #191:
+the writes above the failure are already durable, so committing is not the
+safe, idempotent operation an action is. Preserving the variant would feed a
+partially committed transaction back into the wait-die retry budget. If that
+reasoning turns out to be wrong it is a one-line change — which is the point
+of having `remote_error` in one place.
+
 ## Tests
 
 `meerkat-lib/tests/commit_failure_test.rs` (2 tests).
@@ -66,3 +89,23 @@ downward forward fails must still store, still propagate, still free its locks,
   issue #191. This task makes the failure *visible*, which is a precondition for
   fixing it, not the fix. Say so in the PR description so it is not mistaken for
   a completeness claim.
+
+- **Typed wire errors: considered here, still deferred.** Raised as a nitpick
+  on #199. `remote_error` classifies a remote failure by matching the `Display`
+  prefix `WaitDieAbort` writes, so a human-readable string is load-bearing as a
+  protocol field. This task is the natural place to re-examine that — it is the
+  first to make a *second* kind of `EvalError` cross the wire and be acted on
+  rather than printed. It is still not worth acting on:
+  - All six error-carrying `MeerkatMessage` variants are `String` /
+    `Option<String>`, filled by ~19 producers with `e.to_string()`. Typing one
+    makes it inconsistent with the other five; typing all six is ~32 sites plus
+    a wire-side error enum, since `EvalError` is not `Serialize` and
+    `WaitOn(WaitKey)` cannot trivially become so. Neither belongs in the same
+    diff as a commit-reporting fix.
+  - The version-skew argument for it does not apply. There is no version
+    negotiation beyond libp2p's exact-match `/meerkat/1.0.0` and no
+    `#[serde(default)]` anywhere, so adding a typed field is itself a breaking
+    struct change: it relocates the mixed-version hazard from "misread as
+    terminal" to "message fails to decode" rather than removing it.
+
+  Revisit if a third consumer appears, or when protocol versioning does.
