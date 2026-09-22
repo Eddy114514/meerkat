@@ -1,7 +1,9 @@
 use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
 use super::env::Env;
 use super::graphs::{analysis::compute_dependencies, free_var::cross_service_deps, ServiceGraphs};
-use super::interpreter::{eval, execute, EvalContext, EvalError, ExecuteEffect};
+use super::interpreter::{
+    eval, execute, EvalContext, EvalError, ExecuteEffect, WAIT_DIE_DISPLAY_PREFIX,
+};
 use super::tt::types::ServiceType;
 use crate::net::network_layer::NetworkLayer;
 use crate::net::{
@@ -1287,6 +1289,41 @@ impl Manager {
         }
     }
 
+    /// Rebuild a structured error from a failure a remote node reported.
+    ///
+    /// Errors cross the wire as their `Display` text, so a wait-die abort comes
+    /// back as an ordinary string. Flattening it to `LocalDispatchFailed` turns
+    /// ordinary lock contention into a terminal failure, because
+    /// `execute_action_with_txn` retries `WaitDieAbort` and nothing else. Every
+    /// reply that can carry a lock outcome goes through here so lock requests,
+    /// reads and composed actions all behave the same way.
+    ///
+    /// Matched on the prefix `EvalError`'s `Display` writes, not on the phrase
+    /// appearing anywhere. Error text quotes user input -- an assertion carries
+    /// its own source text, for one -- so a message that merely mentions
+    /// wait-die would otherwise be retried through the whole budget and then
+    /// reported as a lock conflict that never happened, hiding the real
+    /// failure.
+    ///
+    /// The prefix is stripped rather than kept, because `WaitDieAbort` writes
+    /// it back when it displays itself. Keeping it would nest one copy per node
+    /// the failure passed through -- a retry exhausted on the originator, or a
+    /// node in the middle forwarding it on -- and the message a `@test` reports
+    /// would read `Wait-die abort: Wait-die abort: ...`.
+    ///
+    /// Args:
+    ///     `err` (`String`): The `Display` text a remote node reported
+    ///
+    /// Returns:
+    ///     `EvalError`: `WaitDieAbort` for a lock conflict, otherwise
+    ///     `LocalDispatchFailed`
+    fn remote_error(err: String) -> EvalError {
+        match err.strip_prefix(WAIT_DIE_DISPLAY_PREFIX) {
+            Some(reason) => EvalError::WaitDieAbort(reason.to_string()),
+            None => EvalError::LocalDispatchFailed(err),
+        }
+    }
+
     /// shared by remote_lookup and remote_action.
     pub async fn send_and_await_reply(
         &mut self,
@@ -1616,7 +1653,7 @@ impl Manager {
                     .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
                 Ok(val)
             }
-            MeerkatMessage::LookupError { error, .. } => Err(EvalError::LocalDispatchFailed(error)),
+            MeerkatMessage::LookupError { error, .. } => Err(Self::remote_error(error)),
             MeerkatMessage::Ping { .. }
             | MeerkatMessage::Pong { .. }
             | MeerkatMessage::Announce { .. }
@@ -1753,7 +1790,7 @@ impl Manager {
                     // Participant already registered above; nothing more to do.
                     Ok(())
                 } else {
-                    Err(EvalError::LocalDispatchFailed(
+                    Err(Self::remote_error(
                         error.unwrap_or_else(|| "Remote action failed".to_string()),
                     ))
                 }
@@ -2561,10 +2598,7 @@ impl Manager {
                     if !success {
                         let err_str = error
                             .unwrap_or_else(|| "Lock request rejected by remote node".to_string());
-                        if err_str.contains("Wait-die abort") {
-                            return Err(EvalError::WaitDieAbort(err_str));
-                        }
-                        return Err(EvalError::LocalDispatchFailed(err_str));
+                        return Err(Self::remote_error(err_str));
                     }
                 }
                 _ => {
@@ -3759,6 +3793,112 @@ mod tests {
                 .lock,
             crate::runtime::txn::VarLock::WriteLocked(_)
         ));
+    }
+
+    /// A wait-die abort raised on a participant must still be a wait-die abort
+    /// once it has crossed the wire.
+    ///
+    /// Errors travel as `Display` text, and `execute_action_with_txn` retries
+    /// `WaitDieAbort` and nothing else, so flattening the reply to
+    /// `LocalDispatchFailed` would turn ordinary lock contention into a
+    /// terminal failure. This walks the round trip: the participant's error,
+    /// serialized the way the reply does it, then rebuilt on the originator.
+    #[tokio::test]
+    async fn test_remote_wait_die_survives_the_round_trip() {
+        let mut tc = manager_with_x().await;
+
+        // An older transaction holds `x` exclusively.
+        let older = TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        tc.manager
+            .services
+            .get_mut(&tc.foo)
+            .unwrap()
+            .vars
+            .get_mut(&tc.x)
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(older);
+
+        // A younger transaction reads it as a participant would: wait-die says die.
+        let younger = TxnId::new(tc.manager.node_id);
+        let err = tc
+            .manager
+            .remote_read_participant(tc.foo, tc.x, younger)
+            .await
+            .expect_err("a younger transaction must die against an older holder");
+        assert!(matches!(err, EvalError::WaitDieAbort(_)));
+
+        // This is exactly what the reply carries and what the originator gets.
+        let on_the_wire = err.to_string();
+        let rebuilt = Manager::remote_error(on_the_wire);
+        assert!(
+            matches!(rebuilt, EvalError::WaitDieAbort(_)),
+            "the originator must see a retryable wait-die abort, not a terminal dispatch failure"
+        );
+    }
+
+    /// A wait-die abort must read the same after any number of hops.
+    ///
+    /// `Display` writes `WAIT_DIE_DISPLAY_PREFIX`, and the reply carries that
+    /// text, so rebuilding the variant from the whole reply stores the prefix
+    /// inside the payload and prints it twice. Every further hop -- a retry
+    /// exhausted on the originator, or a node in the middle forwarding the
+    /// failure on -- adds another copy, so the message a `@test` reports grows
+    /// a prefix per node it passed through.
+    #[tokio::test]
+    async fn test_remote_wait_die_prefix_is_not_repeated_per_hop() {
+        let original = EvalError::WaitDieAbort("transaction died contending for 'x'".to_string());
+        let expected = original.to_string();
+
+        let mut text = expected.clone();
+        for hop in 1..=3 {
+            text = Manager::remote_error(text).to_string();
+            assert_eq!(
+                text, expected,
+                "after {hop} hop(s) the message must still read as one wait-die abort"
+            );
+        }
+    }
+
+    /// A remote failure that merely mentions wait-die must stay a failure.
+    ///
+    /// The reply carries `Display` text, so the prefix `WaitDieAbort` writes is
+    /// the only thing that marks a lock conflict. Error messages quote user
+    /// input -- an assertion carries its own source text, so a program that
+    /// compares against the phrase produces one -- and accepting the phrase
+    /// anywhere would send `execute_action_with_txn` through the whole wait-die
+    /// retry budget and then report a lock conflict that never happened,
+    /// instead of the assertion that actually failed.
+    #[tokio::test]
+    async fn test_remote_error_matches_the_wait_die_prefix_not_the_phrase() {
+        let mut tc = TestContext::new();
+
+        // `assert` carries the source text of its condition, so this is the
+        // message a real program produces, not a hand-built string.
+        let stmt = ActionStmt::Assert(
+            Expr::Literal {
+                val: Value::Bool { val: false },
+            },
+            "note == \"Wait-die abort: seen in the log\"".to_string(),
+        );
+        let on_the_wire = match execute(&stmt, &[], &mut tc.manager, tc.foo, None).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a false assertion must fail"),
+        };
+        assert!(
+            on_the_wire.contains("Wait-die abort"),
+            "this test is only meaningful if the message mentions the phrase, got: {on_the_wire}"
+        );
+        assert!(
+            matches!(
+                Manager::remote_error(on_the_wire),
+                EvalError::LocalDispatchFailed(_)
+            ),
+            "a failure that only quotes the phrase must stay terminal, not become retryable"
+        );
     }
 
     #[tokio::test]
