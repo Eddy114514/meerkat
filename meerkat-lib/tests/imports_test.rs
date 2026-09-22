@@ -679,3 +679,71 @@ fn test_local_disk_modules_are_not_claimed_as_remote() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Resolving a local-only program must clear ownership discovered by an
+/// earlier network resolution.
+///
+/// `unified_ast` is replaced on every resolution, so `discovered_remote_services`
+/// has to be too, or the two describe different programs. A stale entry is not
+/// merely cosmetic: `merge_discovered_remote_services` feeds it into the `-i`
+/// map, and `register_and_instantiate_imports` then registers that name as
+/// remote instead of instantiating the local file the program actually
+/// imports.
+#[tokio::test]
+async fn test_local_only_resolution_clears_discovered_ownership() {
+    let dir = unique_temp_dir("stale_owner");
+    std::fs::write(
+        dir.join("helper.mkt"),
+        "service helper {\n    pub def factor = 5;\n}\n",
+    )
+    .expect("write helper.mkt");
+    std::fs::write(
+        dir.join("app.mkt"),
+        "import helper\n\nservice app {\n    pub def v = 1;\n}\n",
+    )
+    .expect("write app.mkt");
+    let app_path = dir.join("app.mkt");
+    let app_path = app_path.to_str().expect("utf-8 path");
+
+    let mut node = meerkat_lib::runtime::Node::new();
+
+    // What an earlier network resolution on this `Node` would have left
+    // behind: a peer claimed to serve `helper`.
+    node.discovered_remote_services.insert(
+        "helper".to_string(),
+        "/ip4/127.0.0.1/tcp/9000/p2p/peer_a/helper".to_string(),
+    );
+
+    let local_prog = node.load_file(app_path).expect("app.mkt parses");
+    node.resolve_imports_with_net(app_path, HashMap::new(), None, None)
+        .await
+        .expect("local-only resolution succeeds")
+        .static_checks()
+        .expect("static checks pass");
+
+    let mut carried = HashMap::new();
+    node.merge_discovered_remote_services(&mut carried);
+    assert!(
+        carried.is_empty(),
+        "a local-only resolution owns no remote services, so nothing may be \
+         carried over from a previous one: {:?}",
+        carried
+    );
+
+    let helper = node.interner.insert("helper");
+    let manager = node
+        .on_manager_startup(true, None, HashMap::new(), &local_prog)
+        .await
+        .expect("startup succeeds");
+
+    assert!(
+        !manager.remote_services.contains_key(&helper),
+        "this program imports `helper` from local disk, so no peer owns it"
+    );
+    assert!(
+        manager.services.contains_key(&helper),
+        "and it must be instantiated here"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

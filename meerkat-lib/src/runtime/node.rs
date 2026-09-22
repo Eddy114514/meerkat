@@ -200,6 +200,11 @@ impl Node {
     fn resolve_local_imports(&mut self, base_ast: &[Stmt], base_dir: &Path) -> Result<Vec<Stmt>> {
         let (imports, _) =
             Imports::new(&mut self.interner, HashMap::new(), base_ast, base_dir, "")?;
+        // Always empty here, since this node serves what it reads from its
+        // own disk. Assigned anyway so that a `Node` reused for a second
+        // program does not keep the first one's peers and register this
+        // import at a stale one.
+        self.discovered_remote_services = imports.remote_service_owners();
         Ok(imports.finalize())
     }
 
