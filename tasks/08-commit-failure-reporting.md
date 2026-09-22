@@ -108,9 +108,13 @@ downward forward fails must still store, still propagate, still free its locks,
 - **Typed wire errors: considered here, still deferred.** Raised as a nitpick
   on #199. `remote_error` classifies a remote failure by matching the `Display`
   prefix `WaitDieAbort` writes, so a human-readable string is load-bearing as a
-  protocol field. This task is the natural place to re-examine that — it is the
-  first to make a *second* kind of `EvalError` cross the wire and be acted on
-  rather than printed. It is still not worth acting on:
+  protocol field. This task is the natural place to re-examine that, because it
+  is the first to let a remote failure string *change the originator's result*
+  rather than only be reported: `execute_action_with_txn` returns `Err` on the
+  strength of text a participant sent. What it does not do is add a second
+  wire-surviving variant — under the default above a refused commit is
+  flattened to `LocalDispatchFailed`, like everything that is not a wait-die
+  abort. It is still not worth acting on:
   - All six error-carrying `MeerkatMessage` variants are `String` /
     `Option<String>`, filled by ~19 producers with `e.to_string()`. Typing one
     makes it inconsistent with the other five; typing all six is ~32 sites plus
