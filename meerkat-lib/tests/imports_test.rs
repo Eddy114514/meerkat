@@ -578,6 +578,68 @@ fn test_network_module_owns_every_service_it_declares() {
     assert_eq!(owners.len(), 2, "and nothing else is claimed as remote");
 }
 
+/// A name the root program declares itself is served here, whatever a peer's
+/// module happens to declare.
+///
+/// The fetched file is the peer's own program, so it may name a service this
+/// program also declares. Claiming that name for the peer would push an entry
+/// the user never asked for into the `-i` map, where
+/// `Manager::register_remote_services` discards it again -- but reports it as
+/// an ignored `-i` flag, naming a URL that was never typed.
+#[test]
+fn test_root_declarations_are_not_claimed_by_a_peer() {
+    let mut node = meerkat_lib::runtime::Node::new();
+    let sym_a = node.interner.insert("a");
+    let sym_b = node.interner.insert("b");
+    let base_ast = vec![
+        Stmt::Import {
+            path: "a.mkt".to_string(),
+            service_name: sym_a,
+        },
+        // The root program declares `b` itself, and the peer's module below
+        // happens to declare a `b` too.
+        Stmt::Service {
+            name: sym_b,
+            decls: Vec::new(),
+        },
+    ];
+
+    let mut remote_map = HashMap::new();
+    remote_map.insert(
+        "a".to_string(),
+        "/ip4/127.0.0.1/tcp/9000/p2p/peer_a/a".to_string(),
+    );
+
+    let (mut imports, _cmds) = Imports::new(
+        &mut node.interner,
+        remote_map,
+        &base_ast,
+        Path::new(""),
+        "/ip4/127.0.0.1/tcp/8000/p2p/peer_main",
+    )
+    .expect("Imports::new success");
+
+    imports
+        .on_recv_source(
+            "service a {\n    pub def q = 1;\n}\n\nservice b {\n    pub def y = 2;\n}",
+            "a",
+            Path::new(""),
+        )
+        .expect("on_recv_source a");
+
+    let owners = imports.remote_service_owners();
+
+    assert_eq!(
+        owners.get("a").map(String::as_str),
+        Some("/ip4/127.0.0.1/tcp/9000/p2p/peer_a/a"),
+        "the requested service is still the peer's"
+    );
+    assert!(
+        !owners.contains_key("b"),
+        "this program declares `b`, so it is served here, not at the peer"
+    );
+}
+
 /// A module read from local disk is served by this node, so it claims nothing.
 #[test]
 fn test_local_disk_modules_are_not_claimed_as_remote() {

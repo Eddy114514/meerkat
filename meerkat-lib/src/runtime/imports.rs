@@ -57,6 +57,9 @@ pub struct Imports<'a> {
     pending_services: HashSet<String>,
     remote_url_map: HashMap<String, String>,
     modules: Vec<ImportedModule>,
+    /// Services the root program declares itself. This node serves them, so a
+    /// peer that happens to declare the same name does not own them here.
+    local_declares: HashSet<Symbol>,
     request_counter: u64,
     my_addr: String,
 }
@@ -95,6 +98,7 @@ impl<'a> Imports<'a> {
 
         let mut imports = Imports {
             interner,
+            local_declares: visited_services.clone(),
             visited_services,
             pending_network: HashMap::new(),
             pending_services: HashSet::new(),
@@ -484,6 +488,12 @@ impl<'a> Imports<'a> {
     /// merges directly into the `-i` map. Empty unless imports were fetched
     /// over the network: a module read from local disk is served by this node.
     ///
+    /// A name the root program declares itself is never reported, even when a
+    /// peer's module happens to declare it too: this node serves its own
+    /// declaration. Reporting it would put an entry the user never asked for
+    /// into the `-i` map, where `Manager::register_remote_services` would
+    /// discard it and blame a `-i` flag that was never typed.
+    ///
     /// Returns:
     ///   `HashMap<String, String>`: Service name to serving URL
     pub fn remote_service_owners(&self) -> HashMap<String, String> {
@@ -491,6 +501,9 @@ impl<'a> Imports<'a> {
         for module in &self.modules {
             if let Some(peer) = &module.remote_peer {
                 for declared in &module.declares {
+                    if self.local_declares.contains(declared) {
+                        continue;
+                    }
                     let name = self.interner.get(*declared).to_string();
                     let url = format!("{}/{}", peer.0, name);
                     owners.insert(name, url);

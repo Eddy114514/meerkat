@@ -446,19 +446,6 @@ impl Node {
         Ok(self)
     }
 
-    /// Print Service URLs for all hosted services
-    ///
-    /// Args:
-    ///   `local_ast` (`&[Stmt]`): Local program statements
-    ///   `full_addr` (`&str`): Full listening multiaddress
-    pub fn print_startup_diagnostics(&self, local_ast: &[Stmt], full_addr: &str) {
-        for stmt in local_ast {
-            if let Stmt::Service { name, .. } = stmt {
-                println!("Service URL: {}/{}", full_addr, self.interner.get(*name));
-            }
-        }
-    }
-
     /// Add the peers discovered during import resolution to an `-i` map
     ///
     /// A module fetched from a peer is that peer's own program, so the peer

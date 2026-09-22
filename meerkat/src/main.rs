@@ -8,20 +8,18 @@ use meerkat_lib::net::{
     codec, Address, MeerkatMessage, NetworkCommand, NetworkEvent, NetworkReply, ServiceNetId,
 };
 use meerkat_lib::runtime::ast::{AstPrinter, Stmt};
-use meerkat_lib::runtime::interner::Interner;
+use meerkat_lib::runtime::interner::{Interner, Symbol};
 use meerkat_lib::runtime::interpreter::EvalError;
 use meerkat_lib::runtime::manager::ParkedRequest;
 use meerkat_lib::runtime::txn::WaitKey;
 use meerkat_lib::runtime::{parser, Manager, Node};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 
 #[cfg(debug_assertions)]
 use meerkat_lib::net::types::LockGroup;
 #[cfg(debug_assertions)]
 use meerkat_lib::runtime::txn::TxnId;
-#[cfg(debug_assertions)]
-use std::collections::HashMap;
 
 /// #151: load a persistent libp2p identity keypair from `path`, or create and
 /// save one if the file does not yet exist. Using the same file across runs
@@ -153,6 +151,23 @@ struct Args {
     test_locks: Option<String>,
 }
 
+/// Build the slug -> remote address map the runtime registers `-i` flags from.
+///
+/// A service URL is a node address with the service's slug appended, so the
+/// final path segment names the service the URL serves.
+///
+/// Args:
+///     import_urls (&[String]): Raw `-i <url>` values.
+///
+/// Returns:
+///     HashMap<String, String>: Service slug to the URL serving it.
+fn remote_url_map(import_urls: &[String]) -> HashMap<String, String> {
+    import_urls
+        .iter()
+        .filter_map(|url| Some((url.split('/').next_back()?.to_string(), url.clone())))
+        .collect()
+}
+
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
@@ -174,14 +189,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         .filter_level(log_level)
         .init();
 
-    // Build slug -> remote address map from -i flags
-    let mut remote_url_map: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for url in &args.import_urls {
-        if let Some(slug) = url.split('/').next_back() {
-            remote_url_map.insert(slug.to_string(), url.clone());
-        }
-    }
+    let mut remote_url_map = remote_url_map(&args.import_urls);
 
     let mut node = Node::new();
 
@@ -514,6 +522,44 @@ async fn init_server_services(
     Ok(())
 }
 
+/// The services this node advertises a `Service URL` for.
+///
+/// Driven by the services the manager actually instantiated, not by the
+/// program text: a locally resolved import is served here and so is
+/// advertised, while a service an `-i` flag points at a peer is not. Server
+/// mode once listed the root program alone, which left an imported service
+/// reachable but undiscoverable -- `scripts/mkn.py` learns a node's services
+/// from these lines and nothing else, so a topology whose server hosts a
+/// service via its own `import` failed to launch.
+///
+/// Walked in `unified_ast` order -- imports first, then the program's own
+/// services -- so the output is deterministic for those scrapers.
+///
+/// Args:
+///     manager (&Manager): Manager whose services have been instantiated.
+///
+/// Returns:
+///     Vec<Symbol>: Services to advertise, in advertisement order.
+fn advertised_services(manager: &Manager) -> Vec<Symbol> {
+    let mut seen = HashSet::new();
+    manager
+        .unified_ast
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Service { name, .. } => Some(*name),
+            _ => None,
+        })
+        .filter(|name| manager.services.contains_key(name) && seen.insert(*name))
+        .collect()
+}
+
+/// Print a `Service URL` line for each of `advertised_services`.
+fn print_service_urls(manager: &Manager, full_addr: &str) {
+    for name in advertised_services(manager) {
+        println!("Service URL: {}/{}", full_addr, manager.interner.get(name));
+    }
+}
+
 async fn run_server(
     full_ast: Vec<Stmt>,
     prog: Vec<Stmt>,
@@ -593,22 +639,17 @@ async fn run_server(
     let ws_full_addr = format!("{}/p2p/{}", actual_ws_addr_str, peer_id);
     println!("Browser clients connect at: {}", ws_full_addr);
 
-    // Print service URLs
-    for stmt in &prog {
-        if let Stmt::Service { name, .. } = stmt {
-            println!("Service URL: {}/{}", full_addr, manager.interner.get(*name));
-        }
-    }
-
     // Wire network into manager so server can also do remote lookups
     manager.network = Some(net);
     // Record the canonical address so service identities are stable and match
-    // the advertised Service URLs above.
+    // the advertised Service URLs below.
     manager.set_local_address(full_addr.clone());
 
     // Called after the network is wired, so that remote lookups during
     // service initialization work correctly.
     init_server_services(&mut manager, full_ast, &prog, &remote_url_map).await?;
+
+    print_service_urls(&manager, &full_addr);
 
     println!("Server running, press Ctrl+C to stop...");
 
@@ -1223,15 +1264,10 @@ async fn run_lock_test_client(
     manager.network = Some(net);
 
     // Register all remote service urls from the -i flags so the
-    // manager can resolve service names to network addresses.
-    for url in import_urls {
-        if let Some(slug) = url.split('/').next_back() {
-            let sym = manager.interner.insert(slug);
-            manager
-                .remote_services
-                .insert(sym, Address::new(url.clone()));
-        }
-    }
+    // manager can resolve service names to network addresses. This client
+    // runs no program of its own, so no slug can collide with a local
+    // declaration.
+    manager.register_remote_services(&remote_url_map(import_urls), &HashSet::new());
 
     match test_case {
         // Test: cascade_lock_success
@@ -1600,6 +1636,85 @@ mod tests {
         assert!(
             !exceeds_pending_update_limit(&queue, "peer2"),
             "Should allow new updates from different peers"
+        );
+    }
+
+    /// `-i` slugs come from the URL's final path segment, and each slug maps
+    /// back to the whole URL.
+    #[test]
+    fn remote_url_map_keys_on_the_final_path_segment() {
+        let urls = vec![
+            "/ip4/127.0.0.1/tcp/9000/p2p/12D3xyz/s1".to_string(),
+            "/ip4/127.0.0.1/tcp/9001/p2p/12D3abc/s2".to_string(),
+        ];
+
+        let map = remote_url_map(&urls);
+
+        assert_eq!(map.get("s1"), Some(&urls[0]));
+        assert_eq!(map.get("s2"), Some(&urls[1]));
+        assert_eq!(map.len(), 2);
+    }
+
+    /// A server advertises a `Service URL` for the imports it resolved
+    /// locally, not only for the services its own file declares.
+    ///
+    /// The regression this guards: `run_server` listed the root program while
+    /// `init_server_services` went on creating the imports too, so an
+    /// imported service was served and reachable but never announced.
+    /// `scripts/mkn.py` discovers a node's services from those lines alone, so
+    /// a topology whose server hosts a service via its own `import` stopped
+    /// launching ("imports missing service ... from online node").
+    #[tokio::test]
+    async fn advertised_services_covers_locally_resolved_imports() {
+        let mut interner = Interner::new();
+        let (full, prog) = server_asts(&mut interner);
+        let app = interner.insert("app");
+        let dep = interner.insert("dep");
+
+        let mut manager = Manager::new(interner);
+        manager.local = true;
+        init_server_services(&mut manager, full, &prog, &HashMap::new())
+            .await
+            .expect("server startup succeeds");
+
+        assert_eq!(
+            advertised_services(&manager),
+            vec![dep, app],
+            "both the import and the program's own service are served here, \
+             and in dependency order"
+        );
+    }
+
+    /// A service an `-i` flag points at a peer is served there, not here, so
+    /// this node must not advertise a URL of its own for it.
+    ///
+    /// `app` does not read `dep` here: reading a remote service needs a live
+    /// network layer, which this test deliberately does without.
+    #[tokio::test]
+    async fn advertised_services_omits_remotely_served_services() {
+        let mut interner = Interner::new();
+        let full = parser::parse_string(
+            "service dep { var x = 1; } service app { var y = 2; }",
+            &mut interner,
+        )
+        .expect("fixture parses");
+        let prog = parser::parse_string("service app { var y = 2; }", &mut interner)
+            .expect("fixture parses");
+        let app = interner.insert("app");
+
+        let mut remotes = HashMap::new();
+        remotes.insert("dep".to_string(), "/ip4/127.0.0.1/tcp/9000/dep".to_string());
+
+        let mut manager = Manager::new(interner);
+        manager.local = true;
+        init_server_services(&mut manager, full, &prog, &remotes)
+            .await
+            .expect("server startup succeeds");
+
+        assert_eq!(
+            advertised_services(&manager),
+            vec![app],
+            "a service the peer serves must not be advertised at this node"
         );
     }
 
