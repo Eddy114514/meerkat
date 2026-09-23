@@ -875,25 +875,30 @@ impl Manager {
         // get all vclocks of dependencies
         let mut vclocks: Vec<&VClock> = Vec::new();
 
-        // local inputs
-        match curr_svc.dep.dep_graph.get(def) {
-            Some(local_deps) => {
-                for name in local_deps {
-                    match curr_svc.vars.get(name) {
-                        Some(vs) => vclocks.push(&vs.vector_clock),
-                        None => log::warn!(
-                            "gate: local dep '{}' of def '{}' missing from vars",
-                            self.interner.get(*name),
-                            self.interner.get(*def),
-                        ),
-                    }
+        // ServiceGraphs stores source -> dependent edges. Incoming neighbors
+        // are the local inputs previously held in dep.dep_graph[def]; remote
+        // input clocks still come from dep_cache below.
+        if curr_svc.graphs.reactive_graph.contains_node(*def) {
+            for name in curr_svc
+                .graphs
+                .reactive_graph
+                .neighbors_directed(*def, petgraph::Direction::Incoming)
+            {
+                match curr_svc.vars.get(&name) {
+                    Some(vs) => vclocks.push(&vs.vector_clock),
+                    None => log::warn!(
+                        "gate: local dep '{}' of def '{}' missing from vars",
+                        self.interner.get(name),
+                        self.interner.get(*def),
+                    ),
                 }
             }
-            None => log::warn!(
-                "gate: def '{}' missing from dep_graph in service '{}'",
+        } else {
+            log::warn!(
+                "gate: def '{}' missing from reactive_graph in service '{}'",
                 self.interner.get(*def),
                 self.interner.get(curr_svc.name),
-            ),
+            );
         }
 
         // cross-service inputs
@@ -924,7 +929,7 @@ impl Manager {
     /// cache with this def's cached cross-service deps so MemberAccess resolves
     /// from cache instead of a (possibly remote) lookup. Returns whether the
     /// stored value changed.
-    async fn recompute_def(&mut self, svc: Symbol, def: Symbol) -> bool {
+    pub(crate) async fn recompute_def(&mut self, svc: Symbol, def: Symbol) -> bool {
         let expr = match self
             .services
             .get(&svc)
@@ -954,6 +959,21 @@ impl Manager {
             .map(|m| m.iter().map(|(k, (v, _clk))| (*k, v.clone())).collect())
             .unwrap_or_default();
 
+        let curr_svc = match self.services.get(&svc) {
+            Some(service) => service,
+            None => return false,
+        };
+        let (v_target, gate_ok) = self.compute_v_target(curr_svc, &def);
+        if !gate_ok {
+            return false;
+        }
+
+        // An incoming Update can re-enter recompute_def while evaluation
+        // awaits a remote read. Preserve the suspended outer input cache on
+        // both successful and failed evaluation, as on main. This restore is
+        // not cancellation-safe; a future cancellation boundary must account
+        // for the cache separately.
+        let outer_cache = self.reactive_cache.take();
         self.reactive_cache = Some(cache);
         let result = eval(
             &expr,
@@ -965,10 +985,7 @@ impl Manager {
             },
         )
         .await;
-        // The reactive cache is only valid for the single recompute above (its
-        // entries are this def's cached cross-service deps), so clear it before
-        // returning to avoid leaking stale entries into later evaluations.
-        self.reactive_cache = None;
+        self.reactive_cache = outer_cache;
 
         let value = match result {
             Ok(v) => v,
@@ -982,24 +999,27 @@ impl Manager {
             }
         };
 
-        match self
-            .services
-            .get_mut(&svc)
-            .and_then(|s| s.vars.get_mut(&def))
-        {
-            Some(var_state) => {
+        if let Some(service) = self.services.get_mut(&svc) {
+            if let Some(var_state) = service.vars.get_mut(&def) {
                 let differs = var_state.value != value;
                 var_state.value = value;
+                var_state.vector_clock = v_target;
                 differs
+            } else {
+                // Code updates install new defs through this path. Their first
+                // stored value carries the clock checked for this evaluation.
+                let mut var_state = VarState::new(value);
+                var_state.vector_clock = v_target;
+                service.vars.insert(def, var_state);
+                true
             }
-            None => {
-                log::warn!(
-                    "recompute_def: def '{}' in service '{}' disappeared after recompute",
-                    self.interner.get(def),
-                    self.interner.get(svc)
-                );
-                false
-            }
+        } else {
+            log::warn!(
+                "recompute_def: service '{}' missing when recomputing def '{}'",
+                self.interner.get(svc),
+                self.interner.get(def)
+            );
+            false
         }
     }
 
@@ -2024,11 +2044,10 @@ impl Manager {
                 }
             }
         }
-        let var_state = service.vars.entry(var).or_insert_with(|| VarState {
-            value: Value::Int { val: 0 },
-            lock: crate::runtime::txn::VarLock::Unlocked,
-            latest_write_txn: None,
-        });
+        let var_state = service
+            .vars
+            .entry(var)
+            .or_insert_with(|| VarState::new(Value::Int { val: 0 }));
         if var_state.lock.try_write(txn_id) {
             Ok(())
         } else {
@@ -2843,6 +2862,9 @@ impl Default for Manager {
         Self::new(Interner::new())
     }
 }
+
+#[cfg(test)]
+mod restoration_tests;
 
 #[cfg(test)]
 mod tests {

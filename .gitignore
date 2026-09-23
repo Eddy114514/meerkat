@@ -40,3 +40,5 @@ __pycache__/
 
 # REPL history files
 .meerkat_history.txt
+
+audit/

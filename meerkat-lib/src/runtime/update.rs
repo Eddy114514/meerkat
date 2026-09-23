@@ -386,8 +386,9 @@ impl Transaction {
                                 Decl::DefDecl {
                                     name: decl_name, ..
                                 } => {
-                                    manager.recompute_def(*svc_name, *decl_name).await;
-                                    manager.propagate(*svc_name, *decl_name).await;
+                                    if manager.recompute_def(*svc_name, *decl_name).await {
+                                        manager.propagate(*svc_name, *decl_name).await;
+                                    }
                                 }
                                 Decl::TableDecl { .. } => {}
                             }
@@ -455,14 +456,9 @@ impl Transaction {
                     var_state.value = val;
                     var_state.lock = VarLock::Unlocked;
                 } else {
-                    service.vars.insert(
-                        var_name,
-                        crate::runtime::txn::VarState {
-                            value: val,
-                            lock: VarLock::Unlocked,
-                            latest_write_txn: None,
-                        },
-                    );
+                    service
+                        .vars
+                        .insert(var_name, crate::runtime::txn::VarState::new(val));
                 }
             }
         }
