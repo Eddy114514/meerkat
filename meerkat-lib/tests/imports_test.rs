@@ -446,7 +446,7 @@ async fn test_on_node_startup_also_orders_imports_first() {
 
 /// The same ordering must hold when the modules arrive over the network.
 ///
-/// Local disk resolution recurses through `on_recv_source`, so the disk test
+/// Local disk resolution recurses through `record_source`, so the disk test
 /// above already exercises the arrival order indirectly. Over the network the
 /// replies arrive as separate events, which is the case `Imports` was actually
 /// reported for: `main -> a -> b` is recorded as `[a, b]` because a file's own
@@ -513,4 +513,237 @@ fn test_network_imports_are_dependency_ordered_regardless_of_arrival() {
         vec!["b".to_string(), "a".to_string()],
         "`b` arrived second but `a` reads it, so it must be checked first"
     );
+}
+
+/// A peer serves every service the module it sent declares, not just the one
+/// that was asked for.
+///
+/// `-i <url>` names a single slug, so only that service is registered from the
+/// command line. But the file the peer returns is the peer's own program: if
+/// `a.mkt` declares `a` and `b`, the peer runs both. Nothing else fetches `b`
+/// -- recording `a.mkt` marks it visited -- so without this its declarations
+/// sit in the unified AST looking exactly like a local import, and startup
+/// instantiates a second, divergent copy of a service the peer already serves.
+#[test]
+fn test_network_module_owns_every_service_it_declares() {
+    let mut node = meerkat_lib::runtime::Node::new();
+    let sym_a = node.interner.insert("a");
+    let base_ast = vec![
+        Stmt::Import {
+            path: "a.mkt".to_string(),
+            service_name: sym_a,
+        },
+        Stmt::Service {
+            name: node.interner.insert("main_s"),
+            decls: Vec::new(),
+        },
+    ];
+
+    let mut remote_map = HashMap::new();
+    remote_map.insert(
+        "a".to_string(),
+        "/ip4/127.0.0.1/tcp/9000/p2p/peer_a/a".to_string(),
+    );
+
+    let (mut imports, _cmds) = Imports::new(
+        &mut node.interner,
+        remote_map,
+        &base_ast,
+        Path::new(""),
+        "/ip4/127.0.0.1/tcp/8000/p2p/peer_main",
+    )
+    .expect("Imports::new success");
+
+    // One file, two services. Only `a` was ever requested.
+    imports
+        .on_recv_source(
+            "service a {\n    pub def q = b.y * 10;\n}\n\nservice b {\n    pub def y = 2;\n}",
+            "a",
+            Path::new(""),
+        )
+        .expect("on_recv_source a");
+
+    let owners = imports.remote_service_owners();
+
+    assert_eq!(
+        owners.get("a").map(String::as_str),
+        Some("/ip4/127.0.0.1/tcp/9000/p2p/peer_a/a"),
+        "the requested service keeps the URL it was registered with"
+    );
+    assert_eq!(
+        owners.get("b").map(String::as_str),
+        Some("/ip4/127.0.0.1/tcp/9000/p2p/peer_a/b"),
+        "a sibling is served by the same peer, under its own slug"
+    );
+    assert_eq!(owners.len(), 2, "and nothing else is claimed as remote");
+}
+
+/// A name the root program declares itself is served here, whatever a peer's
+/// module happens to declare.
+///
+/// The fetched file is the peer's own program, so it may name a service this
+/// program also declares. Claiming that name for the peer would push an entry
+/// the user never asked for into the `-i` map, where
+/// `Manager::register_remote_services` discards it again -- but reports it as
+/// an ignored `-i` flag, naming a URL that was never typed.
+#[test]
+fn test_root_declarations_are_not_claimed_by_a_peer() {
+    let mut node = meerkat_lib::runtime::Node::new();
+    let sym_a = node.interner.insert("a");
+    let sym_b = node.interner.insert("b");
+    let base_ast = vec![
+        Stmt::Import {
+            path: "a.mkt".to_string(),
+            service_name: sym_a,
+        },
+        // The root program declares `b` itself, and the peer's module below
+        // happens to declare a `b` too.
+        Stmt::Service {
+            name: sym_b,
+            decls: Vec::new(),
+        },
+    ];
+
+    let mut remote_map = HashMap::new();
+    remote_map.insert(
+        "a".to_string(),
+        "/ip4/127.0.0.1/tcp/9000/p2p/peer_a/a".to_string(),
+    );
+
+    let (mut imports, _cmds) = Imports::new(
+        &mut node.interner,
+        remote_map,
+        &base_ast,
+        Path::new(""),
+        "/ip4/127.0.0.1/tcp/8000/p2p/peer_main",
+    )
+    .expect("Imports::new success");
+
+    imports
+        .on_recv_source(
+            "service a {\n    pub def q = 1;\n}\n\nservice b {\n    pub def y = 2;\n}",
+            "a",
+            Path::new(""),
+        )
+        .expect("on_recv_source a");
+
+    let owners = imports.remote_service_owners();
+
+    assert_eq!(
+        owners.get("a").map(String::as_str),
+        Some("/ip4/127.0.0.1/tcp/9000/p2p/peer_a/a"),
+        "the requested service is still the peer's"
+    );
+    assert!(
+        !owners.contains_key("b"),
+        "this program declares `b`, so it is served here, not at the peer"
+    );
+}
+
+/// A module read from local disk is served by this node, so it claims nothing.
+#[test]
+fn test_local_disk_modules_are_not_claimed_as_remote() {
+    let dir = unique_temp_dir("local_owner");
+    std::fs::write(
+        dir.join("dep.mkt"),
+        "service dep {\n    pub def x = 1;\n}\n\nservice sibling {\n    pub def z = 2;\n}",
+    )
+    .expect("write dep.mkt");
+
+    let mut node = meerkat_lib::runtime::Node::new();
+    let sym_dep = node.interner.insert("dep");
+    let base_ast = vec![
+        Stmt::Import {
+            path: "dep.mkt".to_string(),
+            service_name: sym_dep,
+        },
+        Stmt::Service {
+            name: node.interner.insert("app"),
+            decls: Vec::new(),
+        },
+    ];
+
+    let (imports, _cmds) = Imports::new(
+        &mut node.interner,
+        HashMap::new(),
+        &base_ast,
+        dir.as_path(),
+        "",
+    )
+    .expect("Imports::new success");
+
+    assert!(
+        imports.remote_service_owners().is_empty(),
+        "a local disk import is served by this node, not a peer"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Resolving a local-only program must clear ownership discovered by an
+/// earlier network resolution.
+///
+/// `unified_ast` is replaced on every resolution, so `discovered_remote_services`
+/// has to be too, or the two describe different programs. A stale entry is not
+/// merely cosmetic: `merge_discovered_remote_services` feeds it into the `-i`
+/// map, and `register_and_instantiate_imports` then registers that name as
+/// remote instead of instantiating the local file the program actually
+/// imports.
+#[tokio::test]
+async fn test_local_only_resolution_clears_discovered_ownership() {
+    let dir = unique_temp_dir("stale_owner");
+    std::fs::write(
+        dir.join("helper.mkt"),
+        "service helper {\n    pub def factor = 5;\n}\n",
+    )
+    .expect("write helper.mkt");
+    std::fs::write(
+        dir.join("app.mkt"),
+        "import helper\n\nservice app {\n    pub def v = 1;\n}\n",
+    )
+    .expect("write app.mkt");
+    let app_path = dir.join("app.mkt");
+    let app_path = app_path.to_str().expect("utf-8 path");
+
+    let mut node = meerkat_lib::runtime::Node::new();
+
+    // What an earlier network resolution on this `Node` would have left
+    // behind: a peer claimed to serve `helper`.
+    node.discovered_remote_services.insert(
+        "helper".to_string(),
+        "/ip4/127.0.0.1/tcp/9000/p2p/peer_a/helper".to_string(),
+    );
+
+    let local_prog = node.load_file(app_path).expect("app.mkt parses");
+    node.resolve_imports_with_net(app_path, HashMap::new(), None, None)
+        .await
+        .expect("local-only resolution succeeds")
+        .static_checks()
+        .expect("static checks pass");
+
+    let mut carried = HashMap::new();
+    node.merge_discovered_remote_services(&mut carried);
+    assert!(
+        carried.is_empty(),
+        "a local-only resolution owns no remote services, so nothing may be \
+         carried over from a previous one: {:?}",
+        carried
+    );
+
+    let helper = node.interner.insert("helper");
+    let manager = node
+        .on_manager_startup(true, None, HashMap::new(), &local_prog)
+        .await
+        .expect("startup succeeds");
+
+    assert!(
+        !manager.remote_services.contains_key(&helper),
+        "this program imports `helper` from local disk, so no peer owns it"
+    );
+    assert!(
+        manager.services.contains_key(&helper),
+        "and it must be instantiated here"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }

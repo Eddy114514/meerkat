@@ -1,7 +1,9 @@
 use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
 use super::env::Env;
 use super::graphs::{analysis::compute_dependencies, free_var::cross_service_deps, ServiceGraphs};
-use super::interpreter::{eval, execute, EvalContext, EvalError, ExecuteEffect};
+use super::interpreter::{
+    eval, execute, EvalContext, EvalError, ExecuteEffect, WAIT_DIE_DISPLAY_PREFIX,
+};
 use super::tt::types::ServiceType;
 use crate::net::network_layer::NetworkLayer;
 use crate::net::{
@@ -121,6 +123,19 @@ pub struct Manager {
     pub unified_ast: Vec<Stmt>,
     /// Global local services type environment
     pub local_services: Env<'static, ServiceType>,
+}
+
+/// The names of the services a program declares itself.
+///
+/// These are served locally, so an `-i` flag naming one of them is never
+/// honoured: see `Manager::register_remote_services`.
+pub fn local_service_names(prog: &[Stmt]) -> HashSet<Symbol> {
+    prog.iter()
+        .filter_map(|s| match s {
+            Stmt::Service { name, .. } => Some(*name),
+            _ => None,
+        })
+        .collect()
 }
 
 impl Manager {
@@ -251,6 +266,99 @@ impl Manager {
                 // changes mid-run
                 ServiceNetId::new(name_str)
             }
+        }
+    }
+
+    /// Register the parsed `-i <url>` mappings, then instantiate every locally
+    /// resolved import. Steps 1-3 of CLI startup; the caller then creates the
+    /// services the program declares itself, in program order.
+    ///
+    /// Shared by every entry point that starts a node from a parsed program, so
+    /// the ordering below is established once rather than re-derived per
+    /// caller. `unified_ast` must already be set.
+    ///
+    /// `remote_url_map` maps a service slug to the address serving it. The CLI
+    /// builds it from repeated `-i <url>` flags, taking the slug from each
+    /// URL's final path segment (`meerkat/src/main.rs`).
+    ///
+    /// Errors:
+    ///   `EvalError`: If instantiating an imported service fails
+    pub async fn register_and_instantiate_imports(
+        &mut self,
+        prog: &[Stmt],
+        remote_url_map: &HashMap<String, String>,
+    ) -> Result<(), EvalError> {
+        // Services declared by this program itself. An import must not
+        // instantiate these: the caller creates them from `prog`.
+        let local = local_service_names(prog);
+
+        // Register every configured remote service up front, before any import
+        // is processed. Doing it lazily as each root `Stmt::Import` is reached
+        // makes instantiation order-dependent: an earlier local import walks
+        // the whole unified AST, and a remote service it finds there would be
+        // built locally as a phantom copy. A remote service reached only
+        // transitively has no root `Stmt::Import` at all, so it would never be
+        // registered and every read and action would silently target that local
+        // copy instead of the owning node.
+        self.register_remote_services(remote_url_map, &local);
+
+        // Instantiate every locally resolved import before any of this
+        // program's own services, in `unified_ast` order (which is dependency
+        // order). The grammar allows `import` to appear after the service that
+        // uses it, and static checks accept that because the unified AST is
+        // reordered, so creating imports only when their `Stmt::Import` is
+        // reached would build `app` before the `dep` it reads and fail with
+        // `ServiceNotFound`.
+        let imported: Vec<(Symbol, Vec<Decl>)> = self
+            .unified_ast
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Service { name, decls } => Some((*name, decls.clone())),
+                _ => None,
+            })
+            .filter(|(name, _)| !local.contains(name) && !self.remote_services.contains_key(name))
+            .collect();
+        for (name, decls) in imported {
+            if self.services.contains_key(&name) {
+                continue;
+            }
+            self.create_service(name, decls).await?;
+            println!("Imported service '{}'", self.interner.get(name));
+        }
+        Ok(())
+    }
+
+    /// Record each entry of `remote_url_map` -- service slug to the address
+    /// serving it -- in `remote_services`.
+    ///
+    /// The CLI builds that map from repeated `-i <url>` flags, taking the slug
+    /// from each URL's final path segment (`meerkat/src/main.rs`); a slug is
+    /// therefore whatever the URL happens to end with, not something the user
+    /// states outright.
+    ///
+    /// A service this program declares itself is never registered as remote,
+    /// whatever `-i` says. `lookup` consults `remote_services` before anything
+    /// local, so a slug collision would otherwise route a locally declared
+    /// service's reads and writes to a peer and leave the local copy
+    /// unreachable. Since the slug is implicit, such a collision is easy to
+    /// hit by accident, so it is reported rather than quietly dropped.
+    pub fn register_remote_services(
+        &mut self,
+        remote_url_map: &HashMap<String, String>,
+        local: &HashSet<Symbol>,
+    ) {
+        for (svc, url) in remote_url_map {
+            let sym = self.interner.insert(svc);
+            if local.contains(&sym) {
+                println!(
+                    "Warning: ignoring '-i {}': '{}' is declared by this program \
+                     and is served locally",
+                    url, svc
+                );
+                continue;
+            }
+            self.remote_services.insert(sym, Address::new(url.as_str()));
+            println!("Remote service '{}' registered at {}", svc, url);
         }
     }
 
@@ -1287,6 +1395,41 @@ impl Manager {
         }
     }
 
+    /// Rebuild a structured error from a failure a remote node reported.
+    ///
+    /// Errors cross the wire as their `Display` text, so a wait-die abort comes
+    /// back as an ordinary string. Flattening it to `LocalDispatchFailed` turns
+    /// ordinary lock contention into a terminal failure, because
+    /// `execute_action_with_txn` retries `WaitDieAbort` and nothing else. Every
+    /// reply that can carry a lock outcome goes through here so lock requests,
+    /// reads and composed actions all behave the same way.
+    ///
+    /// Matched on the prefix `EvalError`'s `Display` writes, not on the phrase
+    /// appearing anywhere. Error text quotes user input -- an assertion carries
+    /// its own source text, for one -- so a message that merely mentions
+    /// wait-die would otherwise be retried through the whole budget and then
+    /// reported as a lock conflict that never happened, hiding the real
+    /// failure.
+    ///
+    /// The prefix is stripped rather than kept, because `WaitDieAbort` writes
+    /// it back when it displays itself. Keeping it would nest one copy per node
+    /// the failure passed through -- a retry exhausted on the originator, or a
+    /// node in the middle forwarding it on -- and the message a `@test` reports
+    /// would read `Wait-die abort: Wait-die abort: ...`.
+    ///
+    /// Args:
+    ///     `err` (`String`): The `Display` text a remote node reported
+    ///
+    /// Returns:
+    ///     `EvalError`: `WaitDieAbort` for a lock conflict, otherwise
+    ///     `LocalDispatchFailed`
+    fn remote_error(err: String) -> EvalError {
+        match err.strip_prefix(WAIT_DIE_DISPLAY_PREFIX) {
+            Some(reason) => EvalError::WaitDieAbort(reason.to_string()),
+            None => EvalError::LocalDispatchFailed(err),
+        }
+    }
+
     /// shared by remote_lookup and remote_action.
     pub async fn send_and_await_reply(
         &mut self,
@@ -1430,9 +1573,7 @@ impl Manager {
                 self.interner.get(service)
             ))
         })?;
-        let service_str = self.interner.get(service);
-        let addr_str = full_url.0.trim_end_matches(&format!("/{}", service_str));
-        Ok(Address::new(addr_str))
+        Ok(full_url.node_address(self.interner.get(service)))
     }
 
     /// Get our local address with peer ID for use as reply_to
@@ -1618,7 +1759,7 @@ impl Manager {
                     .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
                 Ok(val)
             }
-            MeerkatMessage::LookupError { error, .. } => Err(EvalError::LocalDispatchFailed(error)),
+            MeerkatMessage::LookupError { error, .. } => Err(Self::remote_error(error)),
             MeerkatMessage::Ping { .. }
             | MeerkatMessage::Pong { .. }
             | MeerkatMessage::Announce { .. }
@@ -1755,7 +1896,7 @@ impl Manager {
                     // Participant already registered above; nothing more to do.
                     Ok(())
                 } else {
-                    Err(EvalError::LocalDispatchFailed(
+                    Err(Self::remote_error(
                         error.unwrap_or_else(|| "Remote action failed".to_string()),
                     ))
                 }
@@ -2577,10 +2718,7 @@ impl Manager {
                     if !success {
                         let err_str = error
                             .unwrap_or_else(|| "Lock request rejected by remote node".to_string());
-                        if err_str.contains("Wait-die abort") {
-                            return Err(EvalError::WaitDieAbort(err_str));
-                        }
-                        return Err(EvalError::LocalDispatchFailed(err_str));
+                        return Err(Self::remote_error(err_str));
                     }
                 }
                 _ => {
@@ -3102,6 +3240,158 @@ mod tests {
             tc.manager.reactive_cache,
             Some(outer),
             "a nested recompute must hand the outer cache back untouched"
+        );
+    }
+
+    /// Build `service <name> { var x = <val>; }`.
+    fn service_stmt(interner: &mut Interner, name: &str, val: i32) -> Stmt {
+        Stmt::Service {
+            name: interner.insert(name),
+            decls: vec![Decl::VarDecl {
+                name: interner.insert("x"),
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val },
+                },
+            }],
+        }
+    }
+
+    /// `local_service_names` reports declarations and nothing else.
+    #[test]
+    fn local_service_names_covers_declarations_only() {
+        let mut interner = Interner::new();
+        let app = interner.insert("app");
+        let dep = interner.insert("dep");
+        let prog = vec![
+            Stmt::Import {
+                path: "dep.mkt".to_string(),
+                service_name: dep,
+            },
+            service_stmt(&mut interner, "app", 0),
+        ];
+
+        let names = local_service_names(&prog);
+
+        assert!(names.contains(&app));
+        assert!(
+            !names.contains(&dep),
+            "an `import` is a reference, not a declaration: counting it would \
+             suppress the `-i` flag that resolves it"
+        );
+    }
+
+    /// An `-i` flag naming a service this program declares must be refused.
+    ///
+    /// `lookup` consults `remote_services` before anything local, so
+    /// registering it would route the locally declared service's reads and
+    /// writes to a peer and leave the local copy permanently unreachable.
+    #[test]
+    fn register_remote_services_skips_locally_declared_services() {
+        let mut manager = Manager::default();
+        let prog = vec![service_stmt(&mut manager.interner, "s2", 0)];
+        let local = local_service_names(&prog);
+        let mut urls = HashMap::new();
+        urls.insert("s2".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+        urls.insert("s9".to_string(), "/ip4/127.0.0.1/tcp/9001".to_string());
+
+        manager.register_remote_services(&urls, &local);
+
+        let s2 = manager.interner.insert("s2");
+        let s9 = manager.interner.insert("s9");
+        assert!(
+            !manager.remote_services.contains_key(&s2),
+            "a locally declared service must never be registered as remote"
+        );
+        assert!(
+            manager.remote_services.contains_key(&s9),
+            "an unrelated -i flag must still be honoured"
+        );
+    }
+
+    /// Imports are instantiated from `unified_ast`, before the program's own
+    /// services and in dependency order.
+    #[tokio::test]
+    async fn register_and_instantiate_imports_builds_imported_services() {
+        let mut manager = Manager::default();
+        let dep = service_stmt(&mut manager.interner, "dep", 7);
+        let app = service_stmt(&mut manager.interner, "app", 1);
+        let prog = vec![app.clone()];
+        manager.unified_ast = vec![dep, app];
+
+        manager
+            .register_and_instantiate_imports(&prog, &HashMap::new())
+            .await
+            .expect("imports instantiate");
+
+        let dep_sym = manager.interner.insert("dep");
+        let app_sym = manager.interner.insert("app");
+        assert!(
+            manager.services.contains_key(&dep_sym),
+            "a locally resolved import must be instantiated"
+        );
+        assert!(
+            !manager.services.contains_key(&app_sym),
+            "the program's own services are created by the caller, in program order"
+        );
+    }
+
+    /// An unrelated `-i` flag must not stop local imports being instantiated.
+    ///
+    /// `run_server` used to be handed `prog` instead of the unified AST
+    /// whenever any `-i` flag was present, which silently dropped every
+    /// locally resolved import in exactly the configuration that mixes local
+    /// and remote services.
+    #[tokio::test]
+    async fn register_and_instantiate_imports_survives_an_unrelated_remote_flag() {
+        let mut manager = Manager::default();
+        let dep = service_stmt(&mut manager.interner, "dep", 7);
+        let app = service_stmt(&mut manager.interner, "app", 1);
+        let prog = vec![app.clone()];
+        manager.unified_ast = vec![dep, app];
+        let mut urls = HashMap::new();
+        urls.insert("far".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+
+        manager
+            .register_and_instantiate_imports(&prog, &urls)
+            .await
+            .expect("imports instantiate");
+
+        let dep_sym = manager.interner.insert("dep");
+        assert!(
+            manager.services.contains_key(&dep_sym),
+            "an unrelated -i flag must not suppress local imports"
+        );
+    }
+
+    /// A service resolved remotely must not also be built locally.
+    ///
+    /// It appears in `unified_ast` because its source was fetched for type
+    /// checking, but the owning node serves it; a local copy would shadow the
+    /// peer, since `lookup` prefers `remote_services`.
+    #[tokio::test]
+    async fn register_and_instantiate_imports_skips_remote_services() {
+        let mut manager = Manager::default();
+        let dep = service_stmt(&mut manager.interner, "dep", 7);
+        let app = service_stmt(&mut manager.interner, "app", 1);
+        let prog = vec![app.clone()];
+        manager.unified_ast = vec![dep, app];
+        let mut urls = HashMap::new();
+        urls.insert("dep".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+
+        manager
+            .register_and_instantiate_imports(&prog, &urls)
+            .await
+            .expect("imports instantiate");
+
+        let dep_sym = manager.interner.insert("dep");
+        assert!(
+            manager.remote_services.contains_key(&dep_sym),
+            "the -i flag must be honoured"
+        );
+        assert!(
+            !manager.services.contains_key(&dep_sym),
+            "a remotely served service must not be built as a local phantom copy"
         );
     }
 
@@ -4386,6 +4676,112 @@ mod tests {
                 .lock,
             crate::runtime::txn::VarLock::WriteLocked(_)
         ));
+    }
+
+    /// A wait-die abort raised on a participant must still be a wait-die abort
+    /// once it has crossed the wire.
+    ///
+    /// Errors travel as `Display` text, and `execute_action_with_txn` retries
+    /// `WaitDieAbort` and nothing else, so flattening the reply to
+    /// `LocalDispatchFailed` would turn ordinary lock contention into a
+    /// terminal failure. This walks the round trip: the participant's error,
+    /// serialized the way the reply does it, then rebuilt on the originator.
+    #[tokio::test]
+    async fn test_remote_wait_die_survives_the_round_trip() {
+        let mut tc = manager_with_x().await;
+
+        // An older transaction holds `x` exclusively.
+        let older = TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        tc.manager
+            .services
+            .get_mut(&tc.foo)
+            .unwrap()
+            .vars
+            .get_mut(&tc.x)
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(older);
+
+        // A younger transaction reads it as a participant would: wait-die says die.
+        let younger = TxnId::new(tc.manager.node_id);
+        let err = tc
+            .manager
+            .remote_read_participant(tc.foo, tc.x, younger)
+            .await
+            .expect_err("a younger transaction must die against an older holder");
+        assert!(matches!(err, EvalError::WaitDieAbort(_)));
+
+        // This is exactly what the reply carries and what the originator gets.
+        let on_the_wire = err.to_string();
+        let rebuilt = Manager::remote_error(on_the_wire);
+        assert!(
+            matches!(rebuilt, EvalError::WaitDieAbort(_)),
+            "the originator must see a retryable wait-die abort, not a terminal dispatch failure"
+        );
+    }
+
+    /// A wait-die abort must read the same after any number of hops.
+    ///
+    /// `Display` writes `WAIT_DIE_DISPLAY_PREFIX`, and the reply carries that
+    /// text, so rebuilding the variant from the whole reply stores the prefix
+    /// inside the payload and prints it twice. Every further hop -- a retry
+    /// exhausted on the originator, or a node in the middle forwarding the
+    /// failure on -- adds another copy, so the message a `@test` reports grows
+    /// a prefix per node it passed through.
+    #[tokio::test]
+    async fn test_remote_wait_die_prefix_is_not_repeated_per_hop() {
+        let original = EvalError::WaitDieAbort("transaction died contending for 'x'".to_string());
+        let expected = original.to_string();
+
+        let mut text = expected.clone();
+        for hop in 1..=3 {
+            text = Manager::remote_error(text).to_string();
+            assert_eq!(
+                text, expected,
+                "after {hop} hop(s) the message must still read as one wait-die abort"
+            );
+        }
+    }
+
+    /// A remote failure that merely mentions wait-die must stay a failure.
+    ///
+    /// The reply carries `Display` text, so the prefix `WaitDieAbort` writes is
+    /// the only thing that marks a lock conflict. Error messages quote user
+    /// input -- an assertion carries its own source text, so a program that
+    /// compares against the phrase produces one -- and accepting the phrase
+    /// anywhere would send `execute_action_with_txn` through the whole wait-die
+    /// retry budget and then report a lock conflict that never happened,
+    /// instead of the assertion that actually failed.
+    #[tokio::test]
+    async fn test_remote_error_matches_the_wait_die_prefix_not_the_phrase() {
+        let mut tc = TestContext::new();
+
+        // `assert` carries the source text of its condition, so this is the
+        // message a real program produces, not a hand-built string.
+        let stmt = ActionStmt::Assert(
+            Expr::Literal {
+                val: Value::Bool { val: false },
+            },
+            "note == \"Wait-die abort: seen in the log\"".to_string(),
+        );
+        let on_the_wire = match execute(&stmt, &[], &mut tc.manager, tc.foo, None).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a false assertion must fail"),
+        };
+        assert!(
+            on_the_wire.contains("Wait-die abort"),
+            "this test is only meaningful if the message mentions the phrase, got: {on_the_wire}"
+        );
+        assert!(
+            matches!(
+                Manager::remote_error(on_the_wire),
+                EvalError::LocalDispatchFailed(_)
+            ),
+            "a failure that only quotes the phrase must stay terminal, not become retryable"
+        );
     }
 
     #[tokio::test]

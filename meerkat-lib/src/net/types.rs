@@ -37,6 +37,28 @@ impl Address {
     pub fn new(addr: impl Into<String>) -> Self {
         Address(addr.into())
     }
+
+    /// The address of the node serving `service_name`
+    ///
+    /// A service URL is a node address plus the service's slug (see
+    /// `ServiceNetId`), so dialling the node means dropping that slug. A bare
+    /// node address is accepted wherever a service URL is, so the slug is
+    /// removed only when it is actually there, and only once: unlike
+    /// `ServiceNetId`'s own split, this never chops a segment that is not the
+    /// slug it was told to look for.
+    ///
+    /// Args:
+    ///   `service_name` (`&str`): Slug to drop if present
+    ///
+    /// Returns:
+    ///   `Address`: The serving node's address
+    pub fn node_address(&self, service_name: &str) -> Address {
+        Address::new(
+            self.0
+                .strip_suffix(&format!("/{}", service_name))
+                .unwrap_or(&self.0),
+        )
+    }
 }
 
 /// Globally unique identity of a service (as opposed to a node)
@@ -289,4 +311,42 @@ pub enum NodeType {
         /// `/ip4/server1-ip/tcp/9001/ws/p2p/server1-id`
         relay_server: Address,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A service URL is a node address plus the service slug, so dialling the
+    /// node means dropping the slug.
+    #[test]
+    fn node_address_drops_the_service_slug() {
+        let url = Address::new("/ip4/203.0.113.10/tcp/9000/p2p/12D3xyz/my_service");
+        assert_eq!(
+            node_address_str(&url, "my_service"),
+            "/ip4/203.0.113.10/tcp/9000/p2p/12D3xyz"
+        );
+    }
+
+    /// A bare node address is accepted wherever a service URL is, so a URL
+    /// that carries no slug must come back untouched rather than losing its
+    /// last segment.
+    #[test]
+    fn node_address_leaves_a_slugless_url_alone() {
+        let url = Address::new("/ip4/127.0.0.1/tcp/9000");
+        assert_eq!(node_address_str(&url, "dep"), "/ip4/127.0.0.1/tcp/9000");
+    }
+
+    /// Only the trailing slug goes, even when the segment before it happens to
+    /// repeat the service name. The previous `trim_end_matches` spelling of
+    /// this removed every repetition and left the address one segment short.
+    #[test]
+    fn node_address_drops_only_the_final_slug() {
+        let url = Address::new("/ip4/127.0.0.1/tcp/9000/a/a");
+        assert_eq!(node_address_str(&url, "a"), "/ip4/127.0.0.1/tcp/9000/a");
+    }
+
+    fn node_address_str(addr: &Address, service_name: &str) -> String {
+        addr.node_address(service_name).0
+    }
 }

@@ -45,6 +45,44 @@ keeps going (every participant still needs its `Commit`), then still runs
 `propagate_committed_writes`, and finally returns the recorded error in place of
 `Ok(())`.
 
+### The originator's side of a refused commit
+
+`send_commit` reconstructs an `EvalError` from `CommitResponse`'s `error`
+string (~line 2643 on `main`). It is the fourth such site in `manager/mod.rs`;
+task 05 routed the other three through `Manager::remote_error`, and both that
+task's spec and the reference branch missed this one. It only starts to matter
+here, because `execute_action_with_txn` discards its result today (`let _ =
+self.send_commit(...)`, ~line 2166) — the line this task removes.
+
+Decide explicitly rather than by default, and record the reasoning in the PR:
+
+- **Route it through `remote_error`** and a `WaitDieAbort` raised beneath a
+  participant's commit is preserved as that variant rather than flattened.
+- **Leave it flattened** to `LocalDispatchFailed` and every refused commit
+  arrives as one terminal kind.
+
+Note first what the control flow does *not* do, since the choice is easy to
+misread as being about retries. The wait-die retry branch is gated on
+`exec_error` — the failure of a *statement*, set before the commit loop is
+reached — and it is the only path that loops. A failure recorded in the commit
+loop is handed to the unconditional `return` that follows, so it cannot
+re-enter the retry budget. Nor can it do so on another node:
+`execute_action_with_txn` runs only on the originator, because a participant
+serving a remote action goes through `execute_action_participant`, which has no
+retry loop. Either choice here changes what the failure is *called*, not
+whether the action runs again.
+
+The default is to leave it flattened, and the reason is what the name claims
+rather than what the loop does. `remote_error` exists to preserve one
+distinction — that a failure is routine contention, safe to retry — and
+`WaitDieAbort` is the variant carrying it. A refused commit is not safe to
+retry: the writes above it are already durable (#191). Labelling it
+`WaitDieAbort` would put that false claim into the one variant whose whole
+meaning is retry-safety, where anything keying off it later would believe it —
+and task 06 adds more machinery keyed off exactly that variant. If the
+reasoning turns out to be wrong it is a one-line change, which is the point of
+having `remote_error` in one place.
+
 ## Tests
 
 `meerkat-lib/tests/commit_failure_test.rs` (2 tests).
@@ -66,3 +104,33 @@ downward forward fails must still store, still propagate, still free its locks,
   issue #191. This task makes the failure *visible*, which is a precondition for
   fixing it, not the fix. Say so in the PR description so it is not mistaken for
   a completeness claim.
+
+- **Typed wire errors: considered here, still deferred.** Raised as a nitpick
+  on #199. `remote_error` classifies a remote failure by matching the `Display`
+  prefix `WaitDieAbort` writes, so a human-readable string is load-bearing as a
+  protocol field. This task is the natural place to re-examine that, because it
+  is the first to let a remote failure string *change the originator's result*
+  rather than only be reported: `execute_action_with_txn` returns `Err` on the
+  strength of text a participant sent. What it does not do is add a second
+  wire-surviving variant — under the default above a refused commit is
+  flattened to `LocalDispatchFailed`, like everything that is not a wait-die
+  abort. It is still not worth acting on:
+  - All six error-carrying `MeerkatMessage` variants are `String` /
+    `Option<String>`, filled by ~19 producers with `e.to_string()`. Typing one
+    makes it inconsistent with the other five; typing all six is ~32 sites plus
+    a wire-side error enum, since `EvalError` is not `Serialize` and
+    `WaitOn(WaitKey)` cannot trivially become so. Neither belongs in the same
+    diff as a commit-reporting fix.
+  - The version-skew argument for it does not apply. There is no version
+    negotiation beyond libp2p's exact-match `/meerkat/1.0.0` and no
+    `#[serde(default)]` anywhere, so adding a typed field is itself a breaking
+    struct change: it relocates the mixed-version hazard from "misread as
+    terminal" to "message fails to decode" rather than removing it.
+
+  Revisit when a **second `EvalError` variant has to survive the wire as
+  itself**. Today exactly one does — `WaitDieAbort` — and everything else is
+  deliberately flattened to `LocalDispatchFailed`; task 06 does not add one,
+  since it converts an escaping `WaitOn` into a `WaitDieAbort` before it
+  leaves. The call-site count is not the trigger: `remote_error` gaining a
+  fourth call site above changes nothing, because all four discriminate the
+  same single variant. Revisit also when protocol versioning arrives.

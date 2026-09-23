@@ -1,0 +1,5 @@
+import helper
+
+service hub {
+    pub def scaled = helper.factor * 2;
+}
