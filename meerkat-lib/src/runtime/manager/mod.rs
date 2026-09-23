@@ -7,12 +7,12 @@ use super::interpreter::{
 use super::tt::types::ServiceType;
 use crate::net::network_layer::NetworkLayer;
 use crate::net::{
-    codec, Address, LockGroup, MeerkatMessage, NetworkActor, NetworkCommand, NetworkEvent,
-    NetworkReply, ServiceNetId,
+    codec, Address, ClockEntry, LockGroup, MeerkatMessage, NetworkActor, NetworkCommand,
+    NetworkEvent, NetworkReply, ReactiveStamp, ServiceNetId,
 };
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::txn::{Transaction, TxnId, VClock, VarState, WaitKey};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -20,11 +20,11 @@ use tokio::sync::oneshot;
 pub const MAX_WAIT_DIE_RETRIES: u32 = 10;
 
 /// One cross-service dependency's cached state: the last value delivered for it
-/// plus the vector clock that value was stamped with by its writer.
-pub type DepEntry = (Value, VClock);
+/// plus its transaction clock and complete reactive source versions.
+pub type DepEntry = (Value, VClock, ReactiveStamp);
 
 /// #24: cached values of each def's cross-service deps:
-/// def -> {(source service, member) -> (value, clock)}.
+/// def -> {(source service, member) -> (value, clock, reactive stamp)}.
 pub type DepCache = HashMap<Symbol, HashMap<(Symbol, Symbol), DepEntry>>;
 
 pub struct Service {
@@ -38,7 +38,7 @@ pub struct Service {
     /// #24: who depends on each member: member -> {(listener service id, def)}.
     pub listeners: HashMap<Symbol, HashSet<(ServiceNetId, Symbol)>>,
     /// #24: cached values of each def's cross-service deps:
-    /// def -> {(source service, member) -> (value, clock)}.
+    /// def -> {(source service, member) -> (value, clock, reactive stamp)}.
     pub dep_cache: DepCache,
     /// Optional lock for whole-service blocking during structural updates
     pub service_lock: Option<TxnId>,
@@ -433,6 +433,13 @@ impl Manager {
         let mut txn = Transaction::new(TxnId::new(self.node_id));
         let mut init_error = None;
 
+        let initial_defs: Vec<_> = decls
+            .iter()
+            .filter_map(|d| match d {
+                Decl::DefDecl { name, .. } => Some(*name),
+                _ => None,
+            })
+            .collect();
         for decl in decls {
             match decl {
                 Decl::VarDecl { name, ty: _, val } => {
@@ -459,6 +466,7 @@ impl Manager {
                         var_value.latest_write_txn = Some(txn.id.clone());
                         service.vars.insert(name, var_value);
                     }
+                    self.stamp_source(svc_name, name);
                 }
                 Decl::DefDecl { name, val, .. } => {
                     let value = match eval(
@@ -519,6 +527,17 @@ impl Manager {
             // wire up listeners
             if commit_error.is_none() {
                 self.update_service_graphs(svc_name, graphs).await;
+                // Initial expression evaluation preserves the existing transaction
+                // semantics. Only complete reactive inputs permit publication.
+                let mut ready = Vec::new();
+                for def in initial_defs {
+                    if self.recompute_def(svc_name, def).await {
+                        ready.push(def);
+                    }
+                }
+                for def in ready {
+                    self.propagate(svc_name, def).await;
+                }
             }
 
             // #98: a participant failed to commit after prepare. Roll
@@ -629,6 +648,12 @@ impl Manager {
                 self.subscribe_remote(owner, member, updated_id.clone(), listener_def)
                     .await;
             }
+        }
+        // Rewiring also removes edges discovered through callable inputs.
+        // Restore those reads even when this edit leaves the caller unchanged.
+        let defs: Vec<_> = self.services[&svc_name].defs.keys().copied().collect();
+        for def in defs {
+            self.select_reactive_inputs(svc_name, def).await;
         }
     }
 
@@ -790,7 +815,7 @@ impl Manager {
     }
 
     // helper function to apply a simultaneous bump, as described in section 5.2 of vector clock semantics
-    fn simultaneous_bump(
+    pub(crate) fn simultaneous_bump(
         &mut self,
         read_set: &HashSet<(Symbol, Symbol)>,
         write_set: &HashSet<(Symbol, Symbol)>,
@@ -823,8 +848,9 @@ impl Manager {
         }
         for (svc, var) in write_set {
             if let Some(vs) = self.services.get_mut(svc).and_then(|s| s.vars.get_mut(var)) {
-                vs.vector_clock = v_base.clone(); // write the new base vector clock back to everything in the write set
+                vs.vector_clock = v_base.clone();
             }
+            self.stamp_source(*svc, *var);
         }
         v_base
     }
@@ -869,158 +895,228 @@ impl Manager {
         }
     }
 
-    // compute v_target from vector clock semantics 5.3 by taking max over all dependent vector clocks
-    // then, determine whether it is glitch-free or not
-    fn compute_v_target(&self, curr_svc: &Service, def: &Symbol) -> (VClock, bool) {
-        // get all vclocks of dependencies
-        let mut vclocks: Vec<&VClock> = Vec::new();
-
-        // ServiceGraphs stores source -> dependent edges. Incoming neighbors
-        // are the local inputs previously held in dep.dep_graph[def]; remote
-        // input clocks still come from dep_cache below.
-        if curr_svc.graphs.reactive_graph.contains_node(*def) {
-            for name in curr_svc
-                .graphs
-                .reactive_graph
-                .neighbors_directed(*def, petgraph::Direction::Incoming)
-            {
-                match curr_svc.vars.get(&name) {
-                    Some(vs) => vclocks.push(&vs.vector_clock),
-                    None => log::warn!(
-                        "gate: local dep '{}' of def '{}' missing from vars",
-                        self.interner.get(name),
-                        self.interner.get(*def),
-                    ),
-                }
-            }
-        } else {
-            log::warn!(
-                "gate: def '{}' missing from reactive_graph in service '{}'",
-                self.interner.get(*def),
-                self.interner.get(curr_svc.name),
-            );
-        }
-
-        // cross-service inputs
-        if let Some(deps) = curr_svc.dep_cache.get(def) {
-            for (_, clk) in deps.values() {
-                vclocks.push(clk);
-            }
-        }
-
-        // compute v_target by taking max over all dependent vector clocks
-        let mut v_target: VClock = HashMap::new();
-        for clk in &vclocks {
-            for (dim, &c) in *clk {
-                let e = v_target.entry(*dim).or_insert(0);
-                *e = (*e).max(c);
-            }
-        }
-        // gate: every input clock is >= v_target
-        let gate_ok = vclocks.iter().all(|clk| {
-            v_target
-                .iter()
-                .all(|(dim, &t)| clk.get(dim).copied().unwrap_or(0) >= t)
+    /// A source is its own reactive root, even at revision zero. VClock still
+    /// retains the existing transaction read/write history independently.
+    fn stamp_source(&mut self, service: Symbol, member: Symbol) {
+        let identity = self.service_net_id_for_name(service).0;
+        let member_name = self.interner.get(member).to_owned();
+        let state = self
+            .services
+            .get_mut(&service)
+            .unwrap()
+            .vars
+            .get_mut(&member)
+            .unwrap();
+        state.reactive = Some(ReactiveStamp {
+            version: state.reactive.as_ref().map_or(1, |stamp| stamp.version + 1),
+            sources: vec![ClockEntry {
+                service: identity,
+                member: member_name,
+                counter: state
+                    .vector_clock
+                    .get(&(service, member))
+                    .copied()
+                    .unwrap_or(0),
+            }],
         });
-        (v_target, gate_ok)
     }
 
-    /// #24: recompute `def` in `svc` from current values, seeding the reactive
-    /// cache with this def's cached cross-service deps so MemberAccess resolves
-    /// from cache instead of a (possibly remote) lookup. Returns whether the
-    /// stored value changed.
-    pub(crate) async fn recompute_def(&mut self, svc: Symbol, def: Symbol) -> bool {
-        let expr = match self
+    /// Freeze the direct graph inputs, including service reads hidden inside
+    /// selected closures. Never replace a missing delivered input by a live read.
+    async fn select_reactive_inputs(
+        &mut self,
+        service: Symbol,
+        def: Symbol,
+    ) -> Option<HashMap<(Symbol, Symbol), DepEntry>> {
+        let owner = self.services.get(&service)?;
+        let listener = owner.id.clone();
+        let mut pending: Vec<_> = owner
+            .graphs
+            .reactive_graph
+            .neighbors_directed(def, petgraph::Direction::Incoming)
+            .map(|member| (service, member))
+            .collect();
+        pending.extend(
+            owner
+                .graphs
+                .cross_deps
+                .get(&def)
+                .into_iter()
+                .flatten()
+                .copied(),
+        );
+        let mut seen = HashSet::new();
+        let mut selected = HashMap::new();
+        let mut complete = true;
+        while let Some((source, member)) = pending.pop() {
+            if !seen.insert((source, member)) {
+                continue;
+            }
+            let local =
+                self.services.contains_key(&source) && !self.remote_services.contains_key(&source);
+            let input = if local {
+                let source = self.services.get_mut(&source).unwrap();
+                source
+                    .listeners
+                    .entry(member)
+                    .or_default()
+                    .insert((listener.clone(), def));
+                source.vars.get(&member).and_then(|s| {
+                    Some((s.value.clone(), s.vector_clock.clone(), s.reactive.clone()?))
+                })
+            } else {
+                self.services[&service]
+                    .dep_cache
+                    .get(&def)
+                    .and_then(|c| c.get(&(source, member)))
+                    .cloned()
+            };
+            let Some(input) = input else {
+                complete = false;
+                if !local {
+                    self.subscribe_remote(source, member, listener.clone(), def)
+                        .await;
+                }
+                continue;
+            };
+            // A returned closure can capture another callable. Include its
+            // service reads too; lexical captures themselves remain immutable.
+            let mut values = vec![&input.0];
+            while let Some(value) = values.pop() {
+                match value {
+                    Value::Closure {
+                        params,
+                        body,
+                        env,
+                        service_name,
+                        ..
+                    } => {
+                        let bound = params
+                            .iter()
+                            .map(|p| p.name)
+                            .chain(env.iter().map(|(s, _)| *s))
+                            .collect();
+                        pending.extend(
+                            super::graphs::free_var::free_var(body, &bound)
+                                .into_iter()
+                                .map(|m| (*service_name, m)),
+                        );
+                        pending.extend(cross_service_deps(body));
+                        values.extend(env.iter().map(|(_, value)| value));
+                    }
+                    Value::List { vals } => values.extend(vals),
+                    _ => {}
+                }
+            }
+            selected.insert((source, member), input);
+        }
+        complete.then_some(selected)
+    }
+
+    /// Compare complete source coverage, not sparse transaction-clock keys.
+    /// Shared origins must agree; a genuinely independent origin adds no wait.
+    fn compute_v_target(
+        inputs: &HashMap<(Symbol, Symbol), DepEntry>,
+    ) -> Option<(VClock, Vec<ClockEntry>)> {
+        let mut target = VClock::new();
+        let mut sources = BTreeMap::new();
+        for (_, clock, stamp) in inputs.values() {
+            for (key, counter) in clock {
+                let t = target.entry(*key).or_insert(0);
+                *t = (*t).max(*counter);
+            }
+            for source in &stamp.sources {
+                let key = (source.service.clone(), source.member.clone());
+                if sources
+                    .insert(key, source.counter)
+                    .is_some_and(|old| old != source.counter)
+                {
+                    return None;
+                }
+            }
+        }
+        Some((
+            target,
+            sources
+                .into_iter()
+                .map(|((service, member), counter)| ClockEntry {
+                    service,
+                    member,
+                    counter,
+                })
+                .collect(),
+        ))
+    }
+
+    /// Successful installation includes same-value source progress. The caller
+    /// propagates that progress; user-facing notifications compare output values.
+    pub(crate) async fn recompute_def(&mut self, service: Symbol, def: Symbol) -> bool {
+        let Some(expr) = self
             .services
-            .get(&svc)
+            .get(&service)
             .and_then(|s| s.defs.get(&def))
             .cloned()
-        {
-            Some(e) => e,
-            None => {
-                log::warn!(
-                    "recompute_def: def '{}' not found in service '{}'",
-                    self.interner.get(def),
-                    self.interner.get(svc)
-                );
-                return false;
-            }
-        };
-        let env: Vec<(Symbol, Value)> = self
-            .services
-            .get(&svc)
-            .map(|s| s.vars.iter().map(|(k, v)| (*k, v.value.clone())).collect())
-            .unwrap_or_default();
-        let cache = self
-            .services
-            .get(&svc)
-            .and_then(|s| s.dep_cache.get(&def))
-            // remove vector clocks for dep_cache to get reactive_cache to typecheck
-            .map(|m| m.iter().map(|(k, (v, _clk))| (*k, v.clone())).collect())
-            .unwrap_or_default();
-
-        let curr_svc = match self.services.get(&svc) {
-            Some(service) => service,
-            None => return false,
-        };
-        let (v_target, gate_ok) = self.compute_v_target(curr_svc, &def);
-        if !gate_ok {
+        else {
             return false;
-        }
-
-        // An incoming Update can re-enter recompute_def while evaluation
-        // awaits a remote read. Preserve the suspended outer input cache on
-        // both successful and failed evaluation, as on main. This restore is
-        // not cancellation-safe; a future cancellation boundary must account
-        // for the cache separately.
-        let outer_cache = self.reactive_cache.take();
-        self.reactive_cache = Some(cache);
+        };
+        // Constructing a closure/action does not read its delayed body. A
+        // caller selecting that closure expands its body reads instead.
+        let inputs = if matches!(expr, Expr::Func { .. } | Expr::Action(_)) {
+            HashMap::new()
+        } else {
+            let Some(inputs) = self.select_reactive_inputs(service, def).await else {
+                return false;
+            };
+            inputs
+        };
+        let Some((clock, sources)) = Self::compute_v_target(&inputs) else {
+            return false;
+        };
+        let cache = inputs
+            .into_iter()
+            .map(|(key, (value, _, _))| (key, value))
+            .collect();
+        let outer_cache = self.reactive_cache.replace(cache);
         let result = eval(
             &expr,
-            &env,
+            &[],
             &mut EvalContext {
                 manager: self,
-                service_name: svc,
+                service_name: service,
                 txn: None,
             },
         )
         .await;
         self.reactive_cache = outer_cache;
-
         let value = match result {
-            Ok(v) => v,
-            Err(e) => {
+            Ok(value) => value,
+            Err(error) => {
                 log::warn!(
-                    "propagation of def '{}' failed: {}",
+                    "propagation of def {} failed: {}",
                     self.interner.get(def),
-                    e
+                    error
                 );
                 return false;
             }
         };
-
-        if let Some(service) = self.services.get_mut(&svc) {
-            if let Some(var_state) = service.vars.get_mut(&def) {
-                let differs = var_state.value != value;
-                var_state.value = value;
-                var_state.vector_clock = v_target;
-                differs
-            } else {
-                // Code updates install new defs through this path. Their first
-                // stored value carries the clock checked for this evaluation.
-                let mut var_state = VarState::new(value);
-                var_state.vector_clock = v_target;
-                service.vars.insert(def, var_state);
-                true
-            }
-        } else {
-            log::warn!(
-                "recompute_def: service '{}' missing when recomputing def '{}'",
-                self.interner.get(svc),
-                self.interner.get(def)
-            );
-            false
+        let state = self
+            .services
+            .get_mut(&service)
+            .unwrap()
+            .vars
+            .entry(def)
+            .or_insert_with(|| VarState::new(value.clone()));
+        let progressed =
+            state.value != value || state.reactive.as_ref().is_none_or(|s| s.sources != sources);
+        state.value = value;
+        state.vector_clock = clock;
+        if progressed {
+            state.reactive = Some(ReactiveStamp {
+                version: state.reactive.as_ref().map_or(1, |s| s.version + 1),
+                sources,
+            });
         }
+        progressed
     }
 
     /// #24: fire-and-forget send (no reply awaited).
@@ -1056,12 +1152,17 @@ impl Manager {
                 return;
             }
         };
-        let (value, clock) = match self
+        let (value, clock, reactive) = match self
             .services
             .get(&svc)
             .and_then(|s| s.vars.get(&member))
-            .map(|vs| (vs.value.clone(), vs.vector_clock.clone()))
-        {
+            .and_then(|vs| {
+                Some((
+                    vs.value.clone(),
+                    vs.vector_clock.clone(),
+                    vs.reactive.clone()?,
+                ))
+            }) {
             Some(v) => v,
             None => {
                 log::warn!(
@@ -1091,6 +1192,7 @@ impl Manager {
             member: self.interner.get(member).to_string(),
             value: net_val,
             clock: codec::encode_clock(&clock, &self.interner),
+            reactive: Some(reactive),
         };
         self.send_oneway(Address::new(&reply_to), msg).await;
     }
@@ -1148,7 +1250,7 @@ impl Manager {
         let member_exists = self
             .services
             .get(&service_sym)
-            .map(|s| s.vars.contains_key(&member_sym))
+            .map(|s| s.vars.contains_key(&member_sym) || s.defs.contains_key(&member_sym))
             .unwrap_or(false);
         if !member_exists {
             return;
@@ -1164,28 +1266,15 @@ impl Manager {
         self.listener_addrs
             .insert(listener_id.clone(), reply_to.clone());
 
-        let current = self
-            .services
-            .get(&service_sym)
-            .and_then(|s| s.vars.get(&member_sym))
-            .map(|vs| (vs.value.clone(), vs.vector_clock.clone()));
-        if let Some((value, clock)) = current {
-            if let Ok(net_val) = codec::encode_value(&value, &self.interner) {
-                let msg = MeerkatMessage::Update {
-                    listener_service: listener_id.0.clone(),
-                    listener_def: self.interner.get(listener_def_sym).to_string(),
-                    source_service: self.interner.get(service_sym).to_string(),
-                    member: self.interner.get(member_sym).to_string(),
-                    value: net_val,
-                    clock: codec::encode_clock(&clock, &self.interner),
-                };
-                self.send_oneway(Address::new(&reply_to), msg).await;
-            }
-        }
+        self.emit_update(&listener_id, listener_def_sym, service_sym, member_sym)
+            .await;
     }
 
     /// #24 listener side: a remote member changed (or its initial value). Cache
     /// it, recompute the dependent def from cache, and cascade to its listeners.
+    /// Returns whether this direct target changed value; same-value source
+    /// progress still cascades and can change other local definitions.
+    #[allow(clippy::too_many_arguments)]
     pub async fn handle_update(
         &mut self,
         listener_id: ServiceNetId,
@@ -1194,32 +1283,40 @@ impl Manager {
         member_sym: Symbol,
         value: crate::net::ast::NetValue,
         clock: VClock,
-    ) {
-        let value = match codec::decode_value(value, &mut self.interner) {
-            Ok(v) => v,
-            Err(_) => return,
+        reactive: Option<ReactiveStamp>,
+    ) -> bool {
+        let Some(stamp) = reactive else {
+            log::warn!("reactive Update lacks source coverage; upgrade the sender");
+            return false;
         };
-
-        let listener_svc = self
-            .services
-            .iter()
-            .find(|(_, s)| s.id == listener_id)
-            .map(|(name, _)| *name);
-        let listener_svc = match listener_svc {
-            Some(n) => n,
-            None => return,
+        let Some(service) = self.service_name_for_net_id(&listener_id) else {
+            return false;
         };
-
-        if let Some(svc) = self.services.get_mut(&listener_svc) {
-            svc.dep_cache
-                .entry(listener_def_sym)
-                .or_default()
-                .insert((source_sym, member_sym), (value, clock));
+        let state = self.services.get_mut(&service).unwrap();
+        let cache = state.dep_cache.entry(listener_def_sym).or_default();
+        if cache
+            .get(&(source_sym, member_sym))
+            .is_some_and(|(_, _, old)| old.version >= stamp.version)
+        {
+            return false;
         }
-
-        if self.recompute_def(listener_svc, listener_def_sym).await {
-            self.propagate(listener_svc, listener_def_sym).await;
+        let Ok(value) = codec::decode_value(value, &mut self.interner) else {
+            return false;
+        };
+        cache.insert((source_sym, member_sym), (value, clock, stamp));
+        let before = state
+            .vars
+            .get(&listener_def_sym)
+            .filter(|v| v.reactive.is_some())
+            .map(|v| v.value.clone());
+        if self.recompute_def(service, listener_def_sym).await {
+            self.propagate(service, listener_def_sym).await;
+            return self.services[&service]
+                .vars
+                .get(&listener_def_sym)
+                .is_some_and(|v| before.as_ref() != Some(&v.value));
         }
+        false
     }
 
     /// Drain all pending network events and dispatch each to the matching
@@ -1272,6 +1369,7 @@ impl Manager {
                         member,
                         value,
                         clock,
+                        reactive,
                     } => {
                         // #24: validate + intern wire names through codec; skip
                         // the message if any identifier fails validation.
@@ -1293,6 +1391,7 @@ impl Manager {
                             member_sym,
                             value,
                             vclock,
+                            reactive,
                         )
                         .await;
                     }
@@ -2867,6 +2966,9 @@ impl Default for Manager {
 mod restoration_tests;
 
 #[cfg(test)]
+mod gate_initialization_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::ast::{Decl, Expr, Value};
@@ -3047,15 +3149,40 @@ mod tests {
         tc.manager.create_service(tc.s2, s2_decls).await.unwrap();
 
         let s2_id = tc.manager.services.get(&tc.s2).unwrap().id.0.clone();
-        let net_val = codec::encode_value(&Value::Int { val: 10 }, &tc.manager.interner).unwrap();
-
-        // simulate a remote Update saying s1.y = 10, stamped with s1.y's clock.
-        // z's only input is this cross-service member, so the gate joins a single
-        // clock and passes trivially regardless of its contents.
-        let z_sym = tc.manager.interner.insert("z");
-        let clock: VClock = HashMap::from([((tc.s1, tc.y), 1u64)]);
+        tc.manager.assign(tc.s1, tc.x, vint(9), None).await.unwrap();
+        let sent = tc.manager.services[&tc.s1].vars[&tc.y].clone();
+        let net_val = codec::encode_value(&sent.value, &tc.manager.interner).unwrap();
+        // Keep a local sentinel, but route s1 reads through the delivered cache.
         tc.manager
-            .handle_update(ServiceNetId(s2_id), z_sym, tc.s1, tc.y, net_val, clock)
+            .remote_services
+            .insert(tc.s1, Address::new("/ip4/127.0.0.1/tcp/1"));
+        tc.manager
+            .services
+            .get_mut(&tc.s1)
+            .unwrap()
+            .vars
+            .get_mut(&tc.y)
+            .unwrap()
+            .value = vint(2);
+        tc.manager
+            .services
+            .get_mut(&tc.s2)
+            .unwrap()
+            .vars
+            .get_mut(&z)
+            .unwrap()
+            .value = vint(4);
+        let z_sym = tc.manager.interner.insert("z");
+        tc.manager
+            .handle_update(
+                ServiceNetId(s2_id),
+                z_sym,
+                tc.s1,
+                tc.y,
+                net_val,
+                sent.vector_clock,
+                sent.reactive,
+            )
             .await;
 
         // recomputed from the cached 10 (not s1's local y of 2): 10 + 2 = 12
@@ -3567,6 +3694,14 @@ mod tests {
     // Overwrite a node's stored value and clock directly, to stage an
     // inconsistent frontier the synchronous cascade would never leave behind.
     fn stage_node(mgr: &mut Manager, svc: Symbol, name: Symbol, value: Value, clock: VClock) {
+        let sources = clock
+            .iter()
+            .map(|(&(service, member), &counter)| ClockEntry {
+                service: mgr.service_net_id_for_name(service).0,
+                member: mgr.interner.get(member).to_owned(),
+                counter,
+            })
+            .collect();
         let vs = mgr
             .services
             .get_mut(&svc)
@@ -3576,6 +3711,10 @@ mod tests {
             .unwrap();
         vs.value = value;
         vs.vector_clock = clock;
+        vs.reactive = Some(ReactiveStamp {
+            version: vs.reactive.as_ref().unwrap().version + 1,
+            sources,
+        });
     }
 
     // Targeted defer-path test. The synchronous cascade always finishes in a
@@ -3680,6 +3819,17 @@ mod tests {
         clock: VClock,
     ) {
         let net_val = codec::encode_value(&value, &mgr.interner).unwrap();
+        let stamp = ReactiveStamp {
+            version: clock.values().copied().max().unwrap() + 1,
+            sources: clock
+                .iter()
+                .map(|(&(source, member), &counter)| ClockEntry {
+                    service: mgr.service_net_id_for_name(source).0,
+                    member: mgr.interner.get(member).to_owned(),
+                    counter,
+                })
+                .collect(),
+        };
         mgr.handle_update(
             ServiceNetId(listener_net_id.to_string()),
             listener_def,
@@ -3687,6 +3837,7 @@ mod tests {
             member,
             net_val,
             clock,
+            Some(stamp),
         )
         .await;
     }
@@ -3727,6 +3878,9 @@ mod tests {
             is_pub: true,
         }];
         tc.manager.create_service(tc.s2, s2_decls).await.unwrap();
+        tc.manager
+            .remote_services
+            .insert(tc.s1, Address::new("/ip4/127.0.0.1/tcp/1"));
         tc.manager.services.get(&tc.s2).unwrap().id.0.clone()
     }
 
@@ -3746,18 +3900,14 @@ mod tests {
         let z = tc.manager.interner.insert("z");
         let s2_id = setup_remote_diamond(&mut tc, a, b, z).await;
 
-        // generation 1: both arms carry (s1,w):1, plus their own dimension. z
+        // generation 1: both derived arms carry the shared root (s1,w):1. z
         // cannot compute until both are cached, so it settles on the 2nd arrival.
-        let clk_a1: VClock = HashMap::from([((tc.s1, tc.w), 1u64), ((tc.s1, a), 1u64)]);
-        let clk_b1: VClock = HashMap::from([((tc.s1, tc.w), 1u64), ((tc.s1, b), 1u64)]);
+        let clk_a1: VClock = HashMap::from([((tc.s1, tc.w), 1u64)]);
+        let clk_b1: VClock = HashMap::from([((tc.s1, tc.w), 1u64)]);
         deliver_update(&mut tc.manager, &s2_id, z, tc.s1, a, vint(11), clk_a1).await;
         deliver_update(&mut tc.manager, &s2_id, z, tc.s1, b, vint(21), clk_b1).await;
 
-        let z_gen1: VClock = HashMap::from([
-            ((tc.s1, tc.w), 1u64),
-            ((tc.s1, a), 1u64),
-            ((tc.s1, b), 1u64),
-        ]);
+        let z_gen1: VClock = HashMap::from([((tc.s1, tc.w), 1u64)]);
         {
             let vs = tc
                 .manager
@@ -3781,16 +3931,12 @@ mod tests {
         // generation 2: advance both arms consistently on (s1,w):2. The lone
         // a@gen-2 arrival transiently disagrees with the still-cached b@gen-1 and
         // is deferred by the gate; only once b@gen-2 lands does z advance.
-        let clk_a2: VClock = HashMap::from([((tc.s1, tc.w), 2u64), ((tc.s1, a), 2u64)]);
-        let clk_b2: VClock = HashMap::from([((tc.s1, tc.w), 2u64), ((tc.s1, b), 2u64)]);
+        let clk_a2: VClock = HashMap::from([((tc.s1, tc.w), 2u64)]);
+        let clk_b2: VClock = HashMap::from([((tc.s1, tc.w), 2u64)]);
         deliver_update(&mut tc.manager, &s2_id, z, tc.s1, a, vint(12), clk_a2).await;
         deliver_update(&mut tc.manager, &s2_id, z, tc.s1, b, vint(22), clk_b2).await;
 
-        let z_gen2: VClock = HashMap::from([
-            ((tc.s1, tc.w), 2u64),
-            ((tc.s1, a), 2u64),
-            ((tc.s1, b), 2u64),
-        ]);
+        let z_gen2: VClock = HashMap::from([((tc.s1, tc.w), 2u64)]);
         let vs = tc
             .manager
             .services
@@ -3825,16 +3971,12 @@ mod tests {
         let s2_id = setup_remote_diamond(&mut tc, a, b, z).await;
 
         // settle a consistent generation-1 frontier: z = 11 + 21 = 32.
-        let clk_a1: VClock = HashMap::from([((tc.s1, tc.w), 1u64), ((tc.s1, a), 1u64)]);
-        let clk_b1: VClock = HashMap::from([((tc.s1, tc.w), 1u64), ((tc.s1, b), 1u64)]);
+        let clk_a1: VClock = HashMap::from([((tc.s1, tc.w), 1u64)]);
+        let clk_b1: VClock = HashMap::from([((tc.s1, tc.w), 1u64)]);
         deliver_update(&mut tc.manager, &s2_id, z, tc.s1, a, vint(11), clk_a1).await;
         deliver_update(&mut tc.manager, &s2_id, z, tc.s1, b, vint(21), clk_b1).await;
 
-        let z_gen1: VClock = HashMap::from([
-            ((tc.s1, tc.w), 1u64),
-            ((tc.s1, a), 1u64),
-            ((tc.s1, b), 1u64),
-        ]);
+        let z_gen1: VClock = HashMap::from([((tc.s1, tc.w), 1u64)]);
         assert_eq!(
             tc.manager
                 .services
@@ -3849,7 +3991,7 @@ mod tests {
         );
 
         // a runs ahead to generation 2 (new value + (s1,w):2), b stays at gen-1.
-        let clk_a2: VClock = HashMap::from([((tc.s1, tc.w), 2u64), ((tc.s1, a), 2u64)]);
+        let clk_a2: VClock = HashMap::from([((tc.s1, tc.w), 2u64)]);
         deliver_update(&mut tc.manager, &s2_id, z, tc.s1, a, vint(12), clk_a2).await;
 
         // gate must DEFER: b (gen-1) lags a (gen-2) on dimension (s1,w). z keeps
@@ -3875,14 +4017,10 @@ mod tests {
         }
 
         // b catches up to generation 2; the gate now passes and z recomputes.
-        let clk_b2: VClock = HashMap::from([((tc.s1, tc.w), 2u64), ((tc.s1, b), 2u64)]);
+        let clk_b2: VClock = HashMap::from([((tc.s1, tc.w), 2u64)]);
         deliver_update(&mut tc.manager, &s2_id, z, tc.s1, b, vint(22), clk_b2).await;
 
-        let z_gen2: VClock = HashMap::from([
-            ((tc.s1, tc.w), 2u64),
-            ((tc.s1, a), 2u64),
-            ((tc.s1, b), 2u64),
-        ]);
+        let z_gen2: VClock = HashMap::from([((tc.s1, tc.w), 2u64)]);
         let vs = tc
             .manager
             .services
@@ -3931,6 +4069,18 @@ mod tests {
             member: src.interner.get(update.member).to_string(),
             value: codec::encode_value(&update.value, &src.interner).unwrap(),
             clock: codec::encode_clock(&update.clock, &src.interner),
+            reactive: Some(ReactiveStamp {
+                version: update.clock.values().copied().max().unwrap() + 1,
+                sources: update
+                    .clock
+                    .iter()
+                    .map(|(&(source, member), &counter)| ClockEntry {
+                        service: src.service_net_id_for_name(source).0,
+                        member: src.interner.get(member).to_owned(),
+                        counter,
+                    })
+                    .collect(),
+            }),
         };
 
         // real transport: the exact serde_json framing recv_message uses
@@ -3938,7 +4088,7 @@ mod tests {
         let msg: MeerkatMessage = serde_json::from_slice(&bytes).unwrap();
 
         // recv side (mirrors the dispatcher's Update arm)
-        let (listener_service, listener_def, source_service, member, net_val, wire_clock) =
+        let (listener_service, listener_def, source_service, member, net_val, wire_clock, reactive) =
             match msg {
                 MeerkatMessage::Update {
                     listener_service,
@@ -3947,6 +4097,7 @@ mod tests {
                     member,
                     value,
                     clock,
+                    reactive,
                 } => (
                     listener_service,
                     listener_def,
@@ -3954,6 +4105,7 @@ mod tests {
                     member,
                     value,
                     clock,
+                    reactive,
                 ),
                 other => panic!("expected Update, got {:?}", other),
             };
@@ -3972,6 +4124,7 @@ mod tests {
             member_sym,
             net_val,
             vclock,
+            reactive,
         )
         .await;
     }
@@ -4013,10 +4166,8 @@ mod tests {
              re-interning path isn't exercised"
         );
 
-        // Local sentinel s1 on B: it only lets s2.z evaluate at creation and
-        // resolves the not-yet-cached arm during the first delivery. z's clock
-        // never depends on it — z's inputs are cross-service, so they come from
-        // the wire via dep_cache, not from local s1's (empty) clock.
+        // Local sentinels allow initial service construction. After s1 is
+        // registered as remote, only complete wire inputs may drive z.
         node_b
             .create_service(
                 b_s1,
@@ -4057,9 +4208,12 @@ mod tests {
             .await
             .unwrap();
         let b_s2_id = node_b.services.get(&b_s2).unwrap().id.0.clone();
+        node_b
+            .remote_services
+            .insert(b_s1, Address::new("/ip4/127.0.0.1/tcp/1"));
 
         // Deliver both arms at a consistent generation 1, each stamped in A's
-        // symbol space: a = 11 @ {(s1,w):1,(s1,a):1}, b = 21 @ {(s1,w):1,(s1,b):1}.
+        // symbol space: a = 11 @ {(s1,w):1}, b = 21 @ {(s1,w):1}.
         send_update_over_wire(
             &node_a,
             &mut node_b,
@@ -4069,7 +4223,7 @@ mod tests {
                 source: a_s1,
                 member: a_a,
                 value: vint(11),
-                clock: HashMap::from([((a_s1, a_w), 1u64), ((a_s1, a_a), 1u64)]),
+                clock: HashMap::from([((a_s1, a_w), 1u64)]),
             },
         )
         .await;
@@ -4082,7 +4236,7 @@ mod tests {
                 source: a_s1,
                 member: a_b,
                 value: vint(21),
-                clock: HashMap::from([((a_s1, a_w), 1u64), ((a_s1, a_b), 1u64)]),
+                clock: HashMap::from([((a_s1, a_w), 1u64)]),
             },
         )
         .await;
@@ -4090,11 +4244,7 @@ mod tests {
         // z recomputed to the consistent sum, and its clock is the join expressed
         // entirely in B's symbol space — proving the dimensions were re-interned,
         // not carried as raw ids.
-        let expected: VClock = HashMap::from([
-            ((b_s1, b_w), 1u64),
-            ((b_s1, b_a), 1u64),
-            ((b_s1, b_b), 1u64),
-        ]);
+        let expected: VClock = HashMap::from([((b_s1, b_w), 1u64)]);
         let vs = node_b.services.get(&b_s2).unwrap().vars.get(&b_z).unwrap();
         assert_eq!(
             vs.value,

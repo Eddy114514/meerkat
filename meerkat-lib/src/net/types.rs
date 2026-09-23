@@ -85,11 +85,20 @@ impl ServiceNetId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClockEntry {
     pub service: String,
     pub member: String,
     pub counter: u64,
+}
+
+/// The actual source versions used by one published reactive value.
+/// `version` orders publications of this member independently of source clocks,
+/// so a formula edit can publish a new value without changing a source version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactiveStamp {
+    pub version: u64,
+    pub sources: Vec<ClockEntry>,
 }
 
 /// Message types in the `Meerkat` protocol
@@ -213,6 +222,8 @@ pub enum MeerkatMessage {
         member: String,
         value: NetValue,
         clock: Vec<ClockEntry>,
+        #[serde(default)]
+        reactive: Option<ReactiveStamp>,
     },
 
     /// #39: request the source of a `.mkt` file by path. A (browser) client

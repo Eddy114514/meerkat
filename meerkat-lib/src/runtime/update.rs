@@ -450,6 +450,7 @@ impl Transaction {
         manager.unified_ast = std::mem::take(&mut self.ast);
         manager.local_services = std::mem::replace(&mut self.types, Env::new(None));
 
+        let mut write_set = HashSet::new();
         for ((svc_name, var_name), val) in std::mem::take(&mut self.values) {
             if let Some(service) = manager.services.get_mut(&svc_name) {
                 if let Some(var_state) = service.vars.get_mut(&var_name) {
@@ -460,8 +461,12 @@ impl Transaction {
                         .vars
                         .insert(var_name, crate::runtime::txn::VarState::new(val));
                 }
+                write_set.insert((svc_name, var_name));
             }
         }
+        // Hot updates install source values directly rather than via assign.
+        // Stamp the entire installed batch before any reactive propagation.
+        manager.simultaneous_bump(&HashSet::new(), &write_set);
 
         for stmt in &manager.unified_ast {
             if let Stmt::Service { name, decls } = stmt {

@@ -139,6 +139,20 @@ pub async fn eval(
                     return Ok(var_val.clone());
                 }
             }
+            if ctx.txn.is_none() {
+                if let Some(cache) = &ctx.manager.reactive_cache {
+                    return cache
+                        .get(&(ctx.service_name, name))
+                        .cloned()
+                        .ok_or_else(|| {
+                            EvalError::VarNotFound(format!(
+                                "Reactive input '{}.{}' missing from selected inputs",
+                                ctx.manager.interner.get(ctx.service_name),
+                                ctx.manager.interner.get(name)
+                            ))
+                        });
+                }
+            }
             ctx.manager
                 .lookup(name, ctx.service_name, ctx.txn.as_deref_mut())
                 .await
@@ -249,12 +263,13 @@ pub async fn eval(
                 .iter()
                 .filter(|(name, _)| {
                     free_vars.contains(name)
-                        && !ctx
-                            .manager
-                            .services
-                            .get(&ctx.service_name)
-                            .map(|s| s.vars.contains_key(name) || s.defs.contains_key(name))
-                            .unwrap_or(false)
+                        && ((ctx.txn.is_none() && ctx.manager.reactive_cache.is_some())
+                            || !ctx
+                                .manager
+                                .services
+                                .get(&ctx.service_name)
+                                .map(|s| s.vars.contains_key(name) || s.defs.contains_key(name))
+                                .unwrap_or(false))
                 })
                 .cloned()
                 .collect();
@@ -301,18 +316,21 @@ pub async fn eval(
             service_name,
             member_name,
         } => {
-            // #24: during a reactive update we check the cache first. If this
-            // (service, member) was already fetched for the def being recomputed,
-            // use the cached value instead of doing a lookup (which for a remote
-            // service would be a network round-trip).
-            if let Some(v) = ctx
-                .manager
-                .reactive_cache
-                .as_ref()
-                .and_then(|c| c.get(&(service_name, member_name)))
-                .cloned()
-            {
-                return Ok(v);
+            // Reactive evaluation must read the same values the gate checked.
+            // Transactions retain their own locked lookup path.
+            if ctx.txn.is_none() {
+                if let Some(cache) = &ctx.manager.reactive_cache {
+                    return cache
+                        .get(&(service_name, member_name))
+                        .cloned()
+                        .ok_or_else(|| {
+                            EvalError::VarNotFound(format!(
+                                "Reactive input '{}.{}' missing from selected inputs",
+                                ctx.manager.interner.get(service_name),
+                                ctx.manager.interner.get(member_name)
+                            ))
+                        });
+                }
             }
             // The `Manager` determines whether the service is local or
             // remote
@@ -489,6 +507,107 @@ mod tests {
                 assert_eq!(captured_env[0].1, Value::Int { val: 1 });
             }
             _ => panic!("Expected Closure"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reactive_function_uses_selected_values_and_lexical_capture() {
+        use crate::runtime::txn::VarState;
+        use std::collections::HashMap;
+
+        let mut manager = Manager::new(Interner::new());
+        let service = manager.interner.insert("service");
+        let x = manager.interner.insert("x");
+        let y = manager.interner.insert("y");
+        manager.create_service(service, vec![]).await.unwrap();
+        let vars = &mut manager.services.get_mut(&service).unwrap().vars;
+        vars.insert(x, VarState::new(Value::Int { val: 99 }));
+        vars.insert(y, VarState::new(Value::Int { val: 99 }));
+        manager.reactive_cache = Some(HashMap::from([
+            ((service, x), Value::Int { val: 1 }),
+            ((service, y), Value::Int { val: 2 }),
+        ]));
+        let curried = Expr::Func {
+            params: vec![Param { name: x, ty: None }],
+            body: Box::new(Expr::Func {
+                params: vec![],
+                body: Box::new(Expr::Binop {
+                    op: BinOp::Add,
+                    expr1: Box::new(Expr::Binop {
+                        op: BinOp::Add,
+                        expr1: Box::new(Expr::Variable { name: x }),
+                        expr2: Box::new(Expr::Variable { name: y }),
+                    }),
+                    expr2: Box::new(Expr::MemberAccess {
+                        service_name: service,
+                        member_name: y,
+                    }),
+                }),
+                return_ty: None,
+            }),
+            return_ty: None,
+        };
+        let expr = Expr::Call {
+            func: Box::new(Expr::Call {
+                func: Box::new(curried),
+                args: vec![Expr::Literal {
+                    val: Value::Int { val: 10 },
+                }],
+            }),
+            args: vec![],
+        };
+        let mut ctx = EvalContext {
+            manager: &mut manager,
+            service_name: service,
+            txn: None,
+        };
+        assert_eq!(
+            eval(&expr, &[], &mut ctx).await.unwrap(),
+            Value::Int { val: 14 }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reactive_missing_input_has_no_fallback_but_transaction_does() {
+        use crate::runtime::txn::{TxnId, VarState};
+        use std::collections::HashMap;
+
+        let mut manager = Manager::new(Interner::new());
+        let service = manager.interner.insert("service");
+        let x = manager.interner.insert("x");
+        manager.create_service(service, vec![]).await.unwrap();
+        manager
+            .services
+            .get_mut(&service)
+            .unwrap()
+            .vars
+            .insert(x, VarState::new(Value::Int { val: 99 }));
+        manager.reactive_cache = Some(HashMap::new());
+        let reads = [
+            Expr::Variable { name: x },
+            Expr::MemberAccess {
+                service_name: service,
+                member_name: x,
+            },
+        ];
+        let mut ctx = EvalContext {
+            manager: &mut manager,
+            service_name: service,
+            txn: None,
+        };
+        for expr in &reads {
+            assert!(matches!(
+                eval(expr, &[], &mut ctx).await,
+                Err(EvalError::VarNotFound(message)) if message.contains("selected inputs")
+            ));
+        }
+        let mut txn = Transaction::new(TxnId::new(ctx.manager.node_id));
+        ctx.txn = Some(&mut txn);
+        for expr in &reads {
+            assert_eq!(
+                eval(expr, &[], &mut ctx).await.unwrap(),
+                Value::Int { val: 99 }
+            );
         }
     }
 

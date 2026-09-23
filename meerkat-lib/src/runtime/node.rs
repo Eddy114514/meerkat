@@ -499,6 +499,15 @@ impl Node {
         manager.unified_ast = self.unified_ast.clone();
         manager.local_services = self.local_services;
 
+        // Fix the same canonical identity used by the CLI before either
+        // imported or local services establish their reactive source labels.
+        if manager.network.is_some() {
+            let address = manager.local_reply_addr().await;
+            if !address.is_empty() {
+                manager.set_local_address(address);
+            }
+        }
+
         // Register the `-i` remotes and instantiate every locally resolved
         // import, before the loop below creates this program's own services:
         // a service may read an import, and `create_service` resolves that
@@ -810,6 +819,43 @@ mod tests {
     use super::*;
     use crate::ast::{ActionStmt, BinOp, Decl, Expr, Value};
     use crate::runtime::tt::Type;
+
+    #[tokio::test]
+    async fn network_startup_distinguishes_same_named_reactive_sources() {
+        let mut managers = Vec::new();
+        let mut identities = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let mut node = Node::new();
+            let service = node.interner.insert("Source");
+            let member = node.interner.insert("x");
+            let local_ast = vec![Stmt::Service {
+                name: service,
+                decls: vec![Decl::VarDecl {
+                    name: member,
+                    ty: None,
+                    val: Expr::Literal {
+                        val: Value::Int { val: 1 },
+                    },
+                }],
+            }];
+            node.unified_ast = local_ast.clone();
+            let (network, address) = node.init_network(None).await.unwrap();
+            let manager = node
+                .on_manager_startup(true, Some(network), HashMap::new(), &local_ast)
+                .await
+                .unwrap();
+            let state = &manager.services[&service];
+            let stamp = state.vars[&member].reactive.as_ref().unwrap();
+            assert_eq!(state.id.0, format!("{address}/Source"));
+            assert_eq!(stamp.sources.len(), 1);
+            assert_eq!(stamp.sources[0].service, state.id.0);
+            assert_eq!(stamp.sources[0].member, "x");
+            assert_eq!(stamp.sources[0].counter, 0);
+            identities.insert(stamp.sources[0].service.clone());
+            managers.push(manager);
+        }
+        assert_eq!(identities.len(), 2);
+    }
 
     /// The third registration path must refuse a colliding `-i` flag too.
     ///

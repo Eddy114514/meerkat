@@ -7,7 +7,7 @@ use meerkat_lib::net::NetworkActor;
 use meerkat_lib::net::{
     codec, Address, MeerkatMessage, NetworkCommand, NetworkEvent, NetworkReply, ServiceNetId,
 };
-use meerkat_lib::runtime::ast::{AstPrinter, Stmt};
+use meerkat_lib::runtime::ast::{AstPrinter, Stmt, Value};
 use meerkat_lib::runtime::interner::{Interner, Symbol};
 use meerkat_lib::runtime::interpreter::EvalError;
 use meerkat_lib::runtime::manager::ParkedRequest;
@@ -991,6 +991,7 @@ async fn run_server(
                     member,
                     value,
                     clock,
+                    reactive,
                 } => {
                     // #24: validate + intern wire names through codec; skip on bad input.
                     // Vector-clock PR: the clock's dimension names are interned here
@@ -1014,6 +1015,7 @@ async fn run_server(
                             member_sym,
                             value,
                             vclock,
+                            reactive,
                         )
                         .await;
                 }
@@ -1202,11 +1204,9 @@ async fn run_client(
                 member,
                 value,
                 clock,
+                reactive,
             }) = msg
             {
-                if let Ok(parsed) = codec::decode_value(value.clone(), &mut manager.interner) {
-                    println!("[update] {}.{} = {:?}", source_service, member, parsed);
-                }
                 let lid = ServiceNetId(listener_service);
                 // #24: validate + intern wire names through codec; skip on bad input.
                 // Vector-clock PR: the clock's dimension names are interned here
@@ -1221,13 +1221,19 @@ async fn run_client(
                     Ok(syms) => syms,
                     Err(_) => continue,
                 };
+                let before = watch_values(&manager);
                 manager
-                    .handle_update(lid.clone(), def_sym, source_sym, member_sym, value, vclock)
+                    .handle_update(
+                        lid, def_sym, source_sym, member_sym, value, vclock, reactive,
+                    )
                     .await;
-                if let Some((_, svc)) = manager.services.iter().find(|(_, s)| s.id == lid) {
-                    if let Some(vs) = svc.vars.get(&def_sym) {
-                        println!("          -> {} = {:?}", listener_def, vs.value);
-                    }
+                for ((service, member), value) in watch_changes(&manager, &before) {
+                    println!(
+                        "[update] {}.{} = {:?}",
+                        manager.interner.get(service),
+                        manager.interner.get(member),
+                        value
+                    );
                 }
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -1235,6 +1241,35 @@ async fn run_client(
     }
 
     Ok(())
+}
+
+/// Include installed local defs only: a provisional initialization value has
+/// not yet passed the gate, and same-value source progress is not a notification.
+fn watch_values(manager: &Manager) -> HashMap<(Symbol, Symbol), Value> {
+    manager
+        .services
+        .iter()
+        .filter(|(service, _)| !manager.remote_services.contains_key(service))
+        .flat_map(|(service, state)| {
+            state.defs.keys().filter_map(|member| {
+                state
+                    .vars
+                    .get(member)
+                    .filter(|v| v.reactive.is_some())
+                    .map(|v| ((*service, *member), v.value.clone()))
+            })
+        })
+        .collect()
+}
+
+fn watch_changes(
+    manager: &Manager,
+    before: &HashMap<(Symbol, Symbol), Value>,
+) -> Vec<((Symbol, Symbol), Value)> {
+    watch_values(manager)
+        .into_iter()
+        .filter(|(key, value)| before.get(key) != Some(value))
+        .collect()
 }
 
 /// Lock group cascade integration test client (debug builds only).
@@ -1587,6 +1622,107 @@ fn exceeds_pending_update_limit(
 mod tests {
     use super::*;
     use meerkat_lib::net::MessageId;
+
+    #[tokio::test]
+    async fn watch_reports_cascade_after_same_value_input_progress() {
+        let mut manager = Manager::default();
+        let ast = parser::parse_string(
+            "service Source { var x = 1; }
+             service Sink {
+                 pub def a = Source.x - Source.x;
+                 pub def c = a + 10;
+                 pub def z = c + Source.x;
+             }",
+            &mut manager.interner,
+        )
+        .unwrap();
+        for stmt in ast {
+            if let Stmt::Service { name, decls } = stmt {
+                manager.create_service(name, decls).await.unwrap();
+            }
+        }
+        let source = manager.interner.insert("Source");
+        let sink = manager.interner.insert("Sink");
+        let x = manager.interner.insert("x");
+        let a = manager.interner.insert("a");
+        let z = manager.interner.insert("z");
+        let listener = manager.services[&sink].id.clone();
+        // Treat Source as remote from this point; seed its two input slots
+        // from the real initialized source state rather than hand-made clocks.
+        manager
+            .remote_services
+            .insert(source, Address::new("unused"));
+        let initial = manager.services[&source].vars[&x].clone();
+        for def in [a, z] {
+            manager
+                .handle_update(
+                    listener.clone(),
+                    def,
+                    source,
+                    x,
+                    codec::encode_value(&initial.value, &manager.interner).unwrap(),
+                    initial.vector_clock.clone(),
+                    initial.reactive.clone(),
+                )
+                .await;
+        }
+        manager
+            .assign(source, x, Value::Int { val: 2 }, None)
+            .await
+            .unwrap();
+        let updated = manager.services[&source].vars[&x].clone();
+        let before = watch_values(&manager);
+        assert_eq!(before[&(sink, z)], Value::Int { val: 11 });
+        // z's x input arrives first, but c still has the initial x version.
+        assert!(
+            !manager
+                .handle_update(
+                    listener.clone(),
+                    z,
+                    source,
+                    x,
+                    codec::encode_value(&updated.value, &manager.interner).unwrap(),
+                    updated.vector_clock.clone(),
+                    updated.reactive.clone(),
+                )
+                .await
+        );
+        assert!(watch_changes(&manager, &before).is_empty());
+        // a remains zero; its version progress nevertheless changes z to 12.
+        // The direct-target bool is false, so watch must examine the cascade.
+        assert!(
+            !manager
+                .handle_update(
+                    listener.clone(),
+                    a,
+                    source,
+                    x,
+                    codec::encode_value(&updated.value, &manager.interner).unwrap(),
+                    updated.vector_clock.clone(),
+                    updated.reactive.clone(),
+                )
+                .await
+        );
+        assert_eq!(
+            watch_changes(&manager, &before),
+            vec![((sink, z), Value::Int { val: 12 })]
+        );
+        let before_duplicate = watch_values(&manager);
+        assert!(
+            !manager
+                .handle_update(
+                    listener,
+                    a,
+                    source,
+                    x,
+                    codec::encode_value(&updated.value, &manager.interner).unwrap(),
+                    updated.vector_clock,
+                    updated.reactive,
+                )
+                .await
+        );
+        assert!(watch_changes(&manager, &before_duplicate).is_empty());
+    }
 
     #[test]
     fn listen_success_addr_returns_bound_address() {

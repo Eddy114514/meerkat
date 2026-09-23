@@ -1,6 +1,6 @@
 //! Transaction ID and per-variable lock state for the `Manager`
 
-use crate::net::{Address, ServiceNetId};
+use crate::net::{Address, ReactiveStamp, ServiceNetId};
 use crate::runtime::ast::Value;
 use crate::runtime::interner::Symbol;
 use serde::{Deserialize, Serialize};
@@ -230,6 +230,9 @@ pub struct VarState {
     // we shouldn't need to deal with any complicated removal semantics since the clock
     // should be monotonically increasing?
     pub vector_clock: VClock,
+    /// `None` is an input whose reactive sources have not been established.
+    /// A known constant has a stamp with an empty source list instead.
+    pub reactive: Option<ReactiveStamp>,
 }
 
 impl VarState {
@@ -240,6 +243,7 @@ impl VarState {
             lock: VarLock::new(),
             latest_write_txn: None,
             vector_clock: HashMap::new(),
+            reactive: None,
         }
     }
 }
