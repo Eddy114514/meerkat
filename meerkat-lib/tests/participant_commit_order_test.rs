@@ -170,6 +170,13 @@ async fn test_participant_commits_sub_participants_before_propagating() {
     // A transaction this node is holding as a participant: it wrote `mv`, and
     // it composed an action onto `rc`, which is therefore holding a write of
     // its own until we tell it to commit.
+    commit_as_participant(&mut m, &mut rc_net, &rc_addr).await;
+    assert_committed_and_recomputed(&mut m);
+}
+
+/// Commit, as a participant, a transaction that wrote `mid.mv` and has `rc` as
+/// a sub-participant
+async fn commit_as_participant(m: &mut Manager, rc_net: &mut NetworkActor, rc_addr: &Address) {
     let mid = m.interner.insert("mid");
     let mv = m.interner.insert("mv");
     let tid = TxnId {
@@ -186,13 +193,39 @@ async fn test_participant_commits_sub_participants_before_propagating() {
     let committed = tokio::select! {
         biased;
         c = m.commit_participant(&tid) => c,
-        _ = serve_rc(&mut rc_net) => unreachable!("the stand-in for rc runs forever"),
+        _ = serve_rc(rc_net) => unreachable!("the stand-in for rc runs forever"),
     };
     assert!(
         committed.is_ok(),
         "forwarding the commit to rc must succeed: {:?}",
         committed
     );
+}
+
+/// In steady state `mid_view`'s value of `rc.gc` comes from `dep_cache`,
+/// filled by the `Update`s `rc` pushes, not from a lookup. `rc`'s `Update` for
+/// this commit can arrive after its `CommitResponse`, so the cache can still
+/// hold the old value when `mid` propagates. The stand-in never sends an
+/// `Update`, which pins exactly that ordering.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_propagation_does_not_use_cached_participant_values() {
+    let (mid_net, _mid_addr) = listening_node().await;
+    let (mut rc_net, rc_addr) = listening_node().await;
+    let mut m = middle_node(mid_net, &rc_addr).await;
+
+    let mid = m.interner.insert("mid");
+    let mid_view = m.interner.insert("mid_view");
+    let rc = m.interner.insert("rc");
+    let gc = m.interner.insert("gc");
+    m.services
+        .get_mut(&mid)
+        .unwrap()
+        .dep_cache
+        .entry(mid_view)
+        .or_default()
+        .insert((rc, gc), Value::Int { val: 1 });
+
+    commit_as_participant(&mut m, &mut rc_net, &rc_addr).await;
     assert_committed_and_recomputed(&mut m);
 }
 

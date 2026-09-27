@@ -2212,9 +2212,39 @@ impl Manager {
     ///
     /// Best-effort: the transaction has committed and there is no way back
     async fn propagate_committed_writes(&mut self, txn: &Transaction) {
+        self.forget_participant_deps(txn);
         for (sid, var) in txn.written.keys() {
             if let Some(name) = self.service_name_for_net_id(sid) {
                 self.propagate(name, *var).await;
+            }
+        }
+    }
+
+    /// Drop the cached values of remote members owned by a transaction's
+    /// participants
+    ///
+    /// `dep_cache` holds whatever the last `Update` delivered, and a
+    /// participant's `Update` for this commit can arrive after its
+    /// `CommitResponse`. Recomputing from the cache would then pair this node's
+    /// new writes with the participant's old values. Without the entries, the
+    /// recompute looks the members up from the participant, which has already
+    /// committed. The next `Update` refills them
+    fn forget_participant_deps(&mut self, txn: &Transaction) {
+        if txn.participants.is_empty() {
+            return;
+        }
+        let owned_by_participants: HashSet<Symbol> = self
+            .remote_services
+            .keys()
+            .copied()
+            .filter(|svc| {
+                self.remote_addr(*svc)
+                    .is_ok_and(|addr| txn.participants.contains(&addr))
+            })
+            .collect();
+        for service in self.services.values_mut() {
+            for cache in service.dep_cache.values_mut() {
+                cache.retain(|(owner, _), _| !owned_by_participants.contains(owner));
             }
         }
     }
