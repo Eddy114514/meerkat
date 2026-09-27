@@ -516,11 +516,11 @@ impl Manager {
                 self.update_service_graphs(svc_name, graphs).await;
             }
 
-            // #98: a participant failed to commit after prepare. Roll
-            // the local service back rather than leaving it
-            // half-committed but live: abort participants and remove the
-            // service, mirroring the init-failure path. The captured
-            // error is returned below
+            // #98: a participant failed to commit. Participants here only hold
+            // read locks (initialization never runs actions), so nothing is left
+            // half-applied: remove the service, mirroring the init-failure path,
+            // and abort participants to release any locks still held. The
+            // captured error is returned below
             if commit_error.is_some() {
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     self.send_abort(addr, &txn.id).await;
