@@ -45,6 +45,13 @@ keeps going (every participant still needs its `Commit`), then still runs
 `propagate_committed_writes`, and finally returns the recorded error in place of
 `Ok(())`.
 
+As landed, the three commit paths (`create_service`, `execute_action_with_txn`,
+`commit_participant`) shared the same store / commit / propagate sequence and
+each handled the commit loop's errors differently. They now share
+`commit_txn`, which returns the first failure. `store_committed_writes` and
+`propagate_committed_writes` were folded into it, and the commit loop itself is
+`commit_participants`, also used by the live-update path in `update.rs`.
+
 ### The originator's side of a refused commit
 
 `send_commit` reconstructs an `EvalError` from `CommitResponse`'s `error`
