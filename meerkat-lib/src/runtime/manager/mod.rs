@@ -490,12 +490,14 @@ impl Manager {
         // #87: commit on success, abort and roll back on failure (pattern from
         // execute_action_with_txn).
         // #98: a participant commit can fail after prepare (timeout, etc.).
-        // Apply local writes, then attempt every participant commit -- do not
+        // Store local writes, then attempt every participant commit -- do not
         // stop at the first failure, or later participants are left prepared --
         // and remember the first error to surface once init otherwise succeeded.
+        // Propagate only after the participants have committed, the same order
+        // as `execute_action_with_txn`
         let mut commit_error = None;
         if init_error.is_none() {
-            self.apply_committed_writes(&txn).await;
+            self.store_committed_writes(&txn);
             for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                 if let Err(e) = self.send_commit(addr, &txn.id).await {
                     if commit_error.is_none() {
@@ -503,6 +505,7 @@ impl Manager {
                     }
                 }
             }
+            self.propagate_committed_writes(&txn).await;
 
             // #24: now that init succeeded, register listener edges so
             // a change to a member notifies the defs that depend on it
@@ -2187,23 +2190,13 @@ impl Manager {
         }
     }
 
-    /// Apply a transaction's buffered writes to the owning services, record
-    /// the writing transaction, and propagate to dependent definitions
-    ///
-    /// Only for a transaction with nothing below it to commit first. Both
-    /// commit paths that can have participants (`execute_action_with_txn` and
-    /// `commit_participant`) call the two halves separately so they can commit
-    /// those participants in between
-    ///
-    /// Infallible: once we are applying writes the transaction is
-    /// committed, so there is no going back. Propagation is best-effort
-    async fn apply_committed_writes(&mut self, txn: &Transaction) {
-        self.store_committed_writes(txn);
-        self.propagate_committed_writes(txn).await;
-    }
-
     /// Store a committed transaction's buffered writes into the owning
-    /// services, without propagating
+    /// services and record the writing transaction, without propagating
+    ///
+    /// Every commit path calls this, then commits its participants, then
+    /// calls `propagate_committed_writes`. Propagating before the nodes below
+    /// have committed would recompute a def over a remote member while that
+    /// member's write is still buffered
     fn store_committed_writes(&mut self, txn: &Transaction) {
         for ((sid, var), value) in &txn.written {
             if let Some(service) = self.service_by_net_id_mut(sid) {
