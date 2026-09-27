@@ -13,11 +13,7 @@ only when the issue's stated verification evidence supports it.
 
 ## Testing
 
-CI (`.github/workflows/ci.yml`) and the pre-commit hooks run the same checks:
-`cargo fmt --check`, `cargo clippy` with `-D warnings`, the wasm32 `cargo
-check`, and `cargo test --workspace` skipping `multiple_message`. CI also runs
-a `meerkat -- --help` smoke test. The exact flags are in
-`.pre-commit-config.yaml`.
+CI (`.github/workflows/ci.yml`) and the pre-commit hooks cover the same Rust checks: formatting, `cargo clippy` with `-D warnings`, the wasm32 `cargo check`, and `cargo test --workspace` skipping `multiple_message`. CI checks formatting with `cargo fmt --all -- --check`; the pre-commit hook runs `cargo fmt --all --` and may rewrite files. CI also runs a `meerkat -- --help` smoke test; see both config files for exact flags.
 
 A full regression run also includes `python3 scripts/test_mkn.py`, the
 multi-node network tests. It is not in CI and takes about a minute. Run
