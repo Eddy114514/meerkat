@@ -11,6 +11,21 @@ apm compile
 For Goal issues, keep the completion contract evidence-based. A goal is complete
 only when the issue's stated verification evidence supports it.
 
+## Testing
+
+CI (`.github/workflows/ci.yml`) and the pre-commit hooks run the same checks:
+`cargo fmt --check`, `cargo clippy` with `-D warnings`, the wasm32 `cargo
+check`, and `cargo test --workspace` skipping `multiple_message`. CI also runs
+a `meerkat -- --help` smoke test. The exact flags are in
+`.pre-commit-config.yaml`.
+
+A full regression run also includes `python3 scripts/test_mkn.py`, the
+multi-node network tests. It is not in CI and takes about a minute. Run
+`cargo build -p meerkat` first: it launches nodes with `cargo run`, and the
+hooks build with `--all-features`, so after a commit the first node can spend
+its startup time compiling and fail with "Timeout waiting for node ... to
+initialize".
+
 ## Known Flaky Tests
 
 These fail intermittently for reasons unrelated to most changes. If one fails,
@@ -22,11 +37,5 @@ here.
 - `mkn_client_timeout_slow` in `scripts/test_mkn.py`: runs no Meerkat code,
   only a 2-second `sleep`, yet sometimes times out.
   [#205](https://github.com/meerkat-lang/meerkat/issues/205)
-
-Run `cargo build -p meerkat` before `scripts/test_mkn.py`. It launches nodes
-with `cargo run`, so if the binary is stale the first node spends its startup
-time compiling and fails with "Timeout waiting for node ... to initialize".
-Pre-commit hooks build with `--all-features`, so this is common right after a
-commit.
 
 List all known flaky tests with `gh issue list --label flaky`.
