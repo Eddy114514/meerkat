@@ -4218,7 +4218,6 @@ mod tests {
             },
         );
 
-        // The younger holder aborts, freeing `x`
         // The younger holder aborts, freeing `x`. The released keys reach the
         // caller through `take_freed_awaiting_wake`
         tc.manager.abort_participant(&younger).await;
