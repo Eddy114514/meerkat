@@ -2161,10 +2161,16 @@ impl Manager {
             }
 
             if exec_error.is_none() {
-                self.apply_committed_writes(&txn).await;
+                // Store locally, then commit the participants, and only then
+                // recompute what is derived from the writes. Propagating first
+                // would recompute a def over a remote member while that
+                // member's node is still holding the write buffered, storing a
+                // value that was never true
+                self.store_committed_writes(&txn);
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     let _ = self.send_commit(addr, &txn.id).await;
                 }
+                self.propagate_committed_writes(&txn).await;
             } else {
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     self.send_abort(addr, &txn.id).await;
@@ -2184,27 +2190,36 @@ impl Manager {
     /// Apply a transaction's buffered writes to the owning services, record
     /// the writing transaction, and propagate to dependent definitions
     ///
-    /// Shared by local commit and by a participant committing on a remote
-    /// `Commit` message
+    /// Only for a transaction with nothing below it to commit first. Both
+    /// commit paths that can have participants (`execute_action_with_txn` and
+    /// `commit_participant`) call the two halves separately so they can commit
+    /// those participants in between
     ///
     /// Infallible: once we are applying writes the transaction is
     /// committed, so there is no going back. Propagation is best-effort
     async fn apply_committed_writes(&mut self, txn: &Transaction) {
-        let writes: Vec<((ServiceNetId, Symbol), Value)> = txn
-            .written
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let txn_id = txn.id.clone();
-        for ((sid, var), value) in &writes {
+        self.store_committed_writes(txn);
+        self.propagate_committed_writes(txn).await;
+    }
+
+    /// Store a committed transaction's buffered writes into the owning
+    /// services, without propagating
+    fn store_committed_writes(&mut self, txn: &Transaction) {
+        for ((sid, var), value) in &txn.written {
             if let Some(service) = self.service_by_net_id_mut(sid) {
                 if let Some(var_state) = service.vars.get_mut(var) {
                     var_state.value = value.clone();
-                    var_state.latest_write_txn = Some(txn_id.clone());
+                    var_state.latest_write_txn = Some(txn.id.clone());
                 }
             }
         }
-        for ((sid, var), _) in &writes {
+    }
+
+    /// Recompute the members derived from a committed transaction's writes
+    ///
+    /// Best-effort: the transaction has committed and there is no way back
+    async fn propagate_committed_writes(&mut self, txn: &Transaction) {
+        for (sid, var) in txn.written.keys() {
             if let Some(name) = self.service_name_for_net_id(sid) {
                 self.propagate(name, *var).await;
             }
@@ -2255,14 +2270,26 @@ impl Manager {
     pub async fn commit_participant(&mut self, tid: &TxnId) -> Result<HashSet<WaitKey>, EvalError> {
         if let Some(txn) = self.pending_txns.remove(tid) {
             let freed = self.all_locked_keys(&txn);
-            self.apply_committed_writes(&txn).await;
-            self.release_locks(&freed, &txn.id);
+            // Same order as the originator in `execute_action_with_txn`: a
+            // node in the middle of a chain may have written locally *and*
+            // composed onto a node below, with a def derived from both. Store,
+            // commit downward, then recompute
+            self.store_committed_writes(&txn);
             let mut forward_err = None;
             for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                 if let Err(e) = self.send_commit(addr, tid).await {
                     forward_err = Some(e);
                 }
             }
+            self.propagate_committed_writes(&txn).await;
+            // Held until here, like the originator holds its own. Today the
+            // event loop is blocked for the whole of this call, so an earlier
+            // release would be harmless. That stops being true under #28's
+            // background message loop, which `send_and_await_reply` is also
+            // waiting on: once other work can interleave here, releasing
+            // before the nodes below have committed exposes half of a
+            // distributed transaction to whoever takes the lock next
+            self.release_locks(&freed, &txn.id);
             match forward_err {
                 Some(e) => Err(e),
                 None => Ok(freed),
