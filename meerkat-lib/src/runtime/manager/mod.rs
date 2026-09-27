@@ -129,20 +129,6 @@ pub struct Manager {
     pub local_services: Env<'static, ServiceType>,
 }
 
-/// What a participant's `Commit` left behind: the locks it released, and any
-/// failure forwarding that commit to the nodes below it
-///
-/// Not a `Result`: the caller needs both on the failing path. The local commit
-/// is done either way, so a forwarding failure is reported upward, and the
-/// freed locks still have to be woken
-#[derive(Debug, Default)]
-pub struct ParticipantCommit {
-    /// Locks released by this commit, to wake anything parked on them
-    pub freed: HashSet<WaitKey>,
-    /// Failure forwarding `Commit` to a sub-participant
-    pub forward_error: Option<EvalError>,
-}
-
 /// The names of the services a program declares itself.
 ///
 /// These are served locally, so an `-i` flag naming one of them is never
@@ -2309,30 +2295,24 @@ impl Manager {
     }
 
     /// Participant side: apply and release a held transaction on `Commit`
-    pub async fn commit_participant(&mut self, tid: &TxnId) -> ParticipantCommit {
-        if let Some(txn) = self.pending_txns.remove(tid) {
-            let freed = self.all_locked_keys(&txn);
-            let forward_error = self.commit_txn(&txn).await;
-            // Held until here, like the originator holds its own. Today the
-            // event loop is blocked for the whole of this call, so an earlier
-            // release would be harmless. That stops being true under #28's
-            // background message loop, which `send_and_await_reply` is also
-            // waiting on: once other work can interleave here, releasing
-            // before the nodes below have committed exposes half of a
-            // distributed transaction to whoever takes the lock next
-            self.release_locks(&freed, &txn.id);
-            // The caller wakes `freed` on the spot, so take these keys back out
-            // of the deferred queue. A key delivered twice is woken twice: the
-            // second wake reaches the next waiter while the first is holding
-            // the lock it was just handed, and wait-die kills it
-            self.freed_awaiting_wake.retain(|k| !freed.contains(k));
-            ParticipantCommit {
-                freed,
-                forward_error,
-            }
-        } else {
-            ParticipantCommit::default()
-        }
+    ///
+    /// An error is a failure forwarding the commit to a node below. The local
+    /// commit is done either way, and the freed keys reach the server loop
+    /// through `freed_awaiting_wake`, so they are woken on that path too
+    pub async fn commit_participant(&mut self, tid: &TxnId) -> Result<(), EvalError> {
+        let Some(txn) = self.pending_txns.remove(tid) else {
+            return Ok(());
+        };
+        let forward_error = self.commit_txn(&txn).await;
+        // Held until here, like the originator holds its own. Today the
+        // event loop is blocked for the whole of this call, so an earlier
+        // release would be harmless. That stops being true under #28's
+        // background message loop, which `send_and_await_reply` is also
+        // waiting on: once other work can interleave here, releasing
+        // before the nodes below have committed exposes half of a
+        // distributed transaction to whoever takes the lock next
+        self.release_all_locks(&txn);
+        forward_error.map_or(Ok(()), Err)
     }
 
     /// Centralized cleanup for a participant transaction that encountered a terminal failure
@@ -4707,14 +4687,14 @@ mod tests {
         );
     }
 
-    /// A commit hands its freed keys to the caller, which wakes them on the
-    /// spot, so it must not also leave them in the deferred queue.
+    /// A commit reports its freed keys through the deferred queue, like every
+    /// other release, and each key is delivered once.
     ///
-    /// Two deliveries of one key wake two waiters: the second wake fires while
-    /// the first waiter is holding the lock it was just handed, and wait-die
-    /// kills the second rather than leaving it parked.
+    /// Two deliveries of one key would wake two waiters: the second wake fires
+    /// while the first waiter is holding the lock it was just handed, and
+    /// wait-die kills the second rather than leaving it parked.
     #[tokio::test]
-    async fn test_commit_does_not_queue_the_keys_it_hands_back() {
+    async fn test_commit_reports_its_freed_keys_once() {
         let mut tc = manager_with_x().await;
         let key = WaitKey::Member(tc.manager.service_net_id_for_name(tc.foo), tc.x);
 
@@ -4743,23 +4723,24 @@ mod tests {
         tc.manager.park_request_key(key.clone(), first);
         tc.manager.park_request_key(key.clone(), second);
 
-        // The server loop commits, then wakes what the commit reports.
-        let committed = tc.manager.commit_participant(&holder).await;
-        assert!(committed.freed.contains(&key));
-        assert!(
-            tc.manager.take_freed_awaiting_wake().is_empty(),
-            "the commit returns its freed keys for the caller to wake, so \
-             queueing them as well delivers them twice"
-        );
+        // The server loop commits, then wakes what the queue reports.
+        tc.manager.commit_participant(&holder).await.unwrap();
+        let freed = tc.manager.take_freed_awaiting_wake();
+        assert!(freed.contains(&key), "the commit released `x`");
 
         // Waking serves the oldest waiter, which takes the lock.
-        let ready = tc.manager.take_ready_waiters(&committed.freed);
+        let ready = tc.manager.take_ready_waiters(&freed);
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].tid(), &first_tid);
         tc.manager
             .execute_action_participant(tc.foo, &[incr_x(&tc)], &[], first_tid)
             .await
             .expect("the freed lock is now the first waiter's");
+        assert!(
+            tc.manager.take_freed_awaiting_wake().is_empty(),
+            "the key was taken once already; a second delivery would wake the \
+             younger waiter against the lock the first one now holds"
+        );
         assert_eq!(
             tc.manager.wait_queue.get(&key).map(|w| w.len()),
             Some(1),

@@ -16,6 +16,7 @@ use meerkat_lib::net::{
     ServiceNetId,
 };
 use meerkat_lib::runtime::ast::{ActionStmt, Expr, Value};
+use meerkat_lib::runtime::manager::ParkedRequest;
 use meerkat_lib::runtime::parser::parse_string;
 use meerkat_lib::runtime::txn::{Transaction, TxnId, VarLock, WaitKey};
 use meerkat_lib::runtime::{Interner, Manager, Node, Symbol};
@@ -242,16 +243,26 @@ async fn test_originator_surfaces_a_participant_commit_failure() {
 /// A participant whose forward of the commit failed reports the failure, and
 /// still propagates and still frees its locks.
 ///
-/// The two outcomes are independent, so `commit_participant` returns them
-/// separately: the caller must report the error *and* wake whatever was parked
-/// on the freed locks.
+/// The two outcomes are independent: the caller must report the error *and*
+/// wake whatever was parked on the freed locks, which it finds in the deferred
+/// queue rather than in the error path's return value.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_participant_reports_a_failed_commit_forward_and_still_propagates() {
     let (mid_net, _mid_addr) = listening_node().await;
     let (mut rc_net, rc_addr) = listening_node().await;
     let mut m = middle_node(mid_net, &rc_addr).await;
 
-    let (tid, key) = hold_participant_txn(&mut m, &[&rc_addr]);
+    let (tid, (sid, mv)) = hold_participant_txn(&mut m, &[&rc_addr]);
+    let key = WaitKey::Member(sid, mv);
+    let mid = m.interner.insert("mid");
+    let waiter = ParkedRequest::Lookup {
+        request_id: 1,
+        reply_to: String::new(),
+        service: mid,
+        member: mv,
+        tid: TxnId::new(m.node_id),
+    };
+    m.park_request_key(key.clone(), waiter);
 
     let got_commit = Cell::new(false);
     let committed = tokio::select! {
@@ -262,15 +273,13 @@ async fn test_participant_reports_a_failed_commit_forward_and_still_propagates()
         }
     };
 
-    let err = committed
-        .forward_error
-        .expect("a refused commit below must be reported upward");
+    let err = committed.expect_err("a refused commit below must be reported upward");
     assert!(
         err.to_string().contains(REASON),
         "the reason must survive the hop, got: {err}"
     );
     assert!(
-        committed.freed.contains(&WaitKey::Member(key.0, key.1)),
+        m.take_freed_awaiting_wake().contains(&key),
         "the freed lock must be reported so what is parked on it gets woken"
     );
     assert_committed_locally(&mut m);
@@ -309,8 +318,7 @@ async fn test_every_participant_is_committed_after_one_refuses() {
     // Which failure is reported depends on the participant set's iteration
     // order, which means nothing to a caller, so either is accepted.
     let err = committed
-        .forward_error
-        .expect("a refused commit must be reported")
+        .expect_err("a refused commit must be reported")
         .to_string();
     assert!(
         err.contains("rc refused") || err.contains("other refused"),

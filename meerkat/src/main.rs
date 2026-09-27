@@ -11,7 +11,6 @@ use meerkat_lib::runtime::ast::{AstPrinter, Stmt};
 use meerkat_lib::runtime::interner::{Interner, Symbol};
 use meerkat_lib::runtime::interpreter::EvalError;
 use meerkat_lib::runtime::manager::ParkedRequest;
-use meerkat_lib::runtime::txn::WaitKey;
 use meerkat_lib::runtime::{parser, Manager, Node};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -460,21 +459,13 @@ async fn dispatch_parked(manager: &mut Manager, parked: ParkedRequest) {
     }
 }
 
-/// After a holder releases its locks, re-dispatch the parked requests waiting
-/// on the freed variables, oldest first.
-async fn wake_ready(manager: &mut Manager, freed: HashSet<WaitKey>) {
-    for parked in manager.take_ready_waiters(&freed) {
-        run_and_reply_or_park(manager, parked).await;
-    }
-}
-
-/// Wake whatever is parked on locks released since the last call
-/// (`Manager::take_freed_awaiting_wake`)
+/// Re-dispatch the requests parked on locks released since the last call
+/// (`Manager::take_freed_awaiting_wake`), oldest first
 async fn wake_freed(manager: &mut Manager) {
     let freed = manager.take_freed_awaiting_wake();
-    if !freed.is_empty() {
-        // Boxed: `wake_ready` and `run_and_reply_or_park` recurse through here
-        Box::pin(wake_ready(manager, freed)).await;
+    for parked in manager.take_ready_waiters(&freed) {
+        // Boxed: this and `run_and_reply_or_park` are mutually recursive
+        Box::pin(run_and_reply_or_park(manager, parked)).await;
     }
 }
 
@@ -903,18 +894,18 @@ async fn run_server(
                     txn_id,
                     reply_to,
                 } => {
-                    let committed = manager.commit_participant(&txn_id).await;
+                    let result = manager.commit_participant(&txn_id).await;
                     let response = MeerkatMessage::CommitResponse {
                         request_id,
-                        success: committed.forward_error.is_none(),
-                        error: committed.forward_error.map(|e| e.to_string()),
+                        success: result.is_ok(),
+                        error: result.err().map(|e| e.to_string()),
                     };
                     if let Some(net) = manager.network.as_mut() {
                         send_net_msg(net, &reply_to, response).await;
                     }
                     // Wake transactions that were waiting on locks this
                     // commit just released, even if forwarding it failed.
-                    wake_ready(&mut manager, committed.freed).await;
+                    wake_freed(&mut manager).await;
                 }
                 MeerkatMessage::Abort {
                     request_id,
@@ -1594,7 +1585,7 @@ fn exceeds_pending_update_limit(
 mod tests {
     use super::*;
     use meerkat_lib::net::MessageId;
-    use meerkat_lib::runtime::txn::TxnId;
+    use meerkat_lib::runtime::txn::{TxnId, WaitKey};
 
     #[test]
     fn listen_success_addr_returns_bound_address() {
