@@ -18,7 +18,8 @@ use meerkat_lib::net::{
 use meerkat_lib::runtime::ast::{ActionStmt, Expr, Value};
 use meerkat_lib::runtime::parser::parse_string;
 use meerkat_lib::runtime::txn::{Transaction, TxnId, VarLock, WaitKey};
-use meerkat_lib::runtime::{Interner, Manager, Node};
+use meerkat_lib::runtime::{Interner, Manager, Node, Symbol};
+use std::cell::Cell;
 use std::collections::HashMap;
 
 const REASON: &str = "node below never acknowledged";
@@ -84,9 +85,10 @@ async fn reply(net: &mut NetworkActor, reply_to: &str, msg: MeerkatMessage) {
         .await;
 }
 
-/// Stand in for `rc`: accept a composed action, refuse every `Commit`, and so
-/// go on serving the `gc = 1` it had committed before. Runs forever.
-async fn refuse_commits(net: &mut NetworkActor) {
+/// Stand in for `rc`: accept a composed action, refuse every `Commit` with
+/// `reason` after recording in `got_commit` that it arrived, and so go on
+/// serving the `gc = 1` it had committed before. Runs forever.
+async fn refuse_commits(net: &mut NetworkActor, reason: &str, got_commit: &Cell<bool>) {
     loop {
         match net.event_rx.try_recv() {
             Ok(NetworkEvent::MessageReceived { msg, .. }) => match msg {
@@ -116,10 +118,11 @@ async fn refuse_commits(net: &mut NetworkActor) {
                     reply_to,
                     ..
                 } => {
+                    got_commit.set(true);
                     let msg = MeerkatMessage::CommitResponse {
                         request_id,
                         success: false,
-                        error: Some(REASON.to_string()),
+                        error: Some(reason.to_string()),
                     };
                     reply(net, &reply_to, msg).await;
                 }
@@ -158,6 +161,37 @@ fn assert_committed_locally(m: &mut Manager) {
     );
 }
 
+/// Hold a transaction on `m` as a participant: it wrote `mid.mv` under a write
+/// lock, and has `participants` as sub-participants. Returns its id and the
+/// locked key.
+fn hold_participant_txn(
+    m: &mut Manager,
+    participants: &[&Address],
+) -> (TxnId, (ServiceNetId, Symbol)) {
+    let mid = m.interner.insert("mid");
+    let mv = m.interner.insert("mv");
+    let tid = TxnId {
+        timestamp: 1,
+        node_id: 7,
+        iteration: 0,
+    };
+    let key = (m.service_net_id_for_name(mid), mv);
+    m.services
+        .get_mut(&mid)
+        .unwrap()
+        .vars
+        .get_mut(&mv)
+        .unwrap()
+        .lock = VarLock::WriteLocked(tid.clone());
+    let mut txn = Transaction::new(tid.clone());
+    txn.locked.insert(key.clone());
+    txn.written.insert(key.clone(), Value::Int { val: 1 });
+    txn.participants
+        .extend(participants.iter().map(|a| (*a).clone()));
+    m.pending_txns.insert(tid.clone(), txn);
+    (tid, key)
+}
+
 /// The originator must not report success when a participant refused to commit.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_originator_surfaces_a_participant_commit_failure() {
@@ -185,10 +219,13 @@ async fn test_originator_surfaces_a_participant_commit_failure() {
         }),
     ];
 
+    let got_commit = Cell::new(false);
     let result = tokio::select! {
         biased;
         r = m.execute_action(mid, &stmts) => r,
-        _ = refuse_commits(&mut rc_net) => unreachable!("the stand-in for rc runs forever"),
+        _ = refuse_commits(&mut rc_net, REASON, &got_commit) => {
+            unreachable!("the stand-in for rc runs forever")
+        }
     };
 
     let err = result.expect_err(
@@ -214,33 +251,15 @@ async fn test_participant_reports_a_failed_commit_forward_and_still_propagates()
     let (mut rc_net, rc_addr) = listening_node().await;
     let mut m = middle_node(mid_net, &rc_addr).await;
 
-    // A transaction this node is holding as a participant: it wrote `mv` under
-    // a write lock, and has `rc` as a sub-participant.
-    let mid = m.interner.insert("mid");
-    let mv = m.interner.insert("mv");
-    let tid = TxnId {
-        timestamp: 1,
-        node_id: 7,
-        iteration: 0,
-    };
-    let key = (m.service_net_id_for_name(mid), mv);
-    m.services
-        .get_mut(&mid)
-        .unwrap()
-        .vars
-        .get_mut(&mv)
-        .unwrap()
-        .lock = VarLock::WriteLocked(tid.clone());
-    let mut txn = Transaction::new(tid.clone());
-    txn.locked.insert(key.clone());
-    txn.written.insert(key.clone(), Value::Int { val: 1 });
-    txn.participants.insert(rc_addr.clone());
-    m.pending_txns.insert(tid.clone(), txn);
+    let (tid, key) = hold_participant_txn(&mut m, &[&rc_addr]);
 
+    let got_commit = Cell::new(false);
     let committed = tokio::select! {
         biased;
         c = m.commit_participant(&tid) => c,
-        _ = refuse_commits(&mut rc_net) => unreachable!("the stand-in for rc runs forever"),
+        _ = refuse_commits(&mut rc_net, REASON, &got_commit) => {
+            unreachable!("the stand-in for rc runs forever")
+        }
     };
 
     let err = committed
@@ -253,6 +272,49 @@ async fn test_participant_reports_a_failed_commit_forward_and_still_propagates()
     assert!(
         committed.freed.contains(&WaitKey::Member(key.0, key.1)),
         "the freed lock must be reported so what is parked on it gets woken"
+    );
+    assert_committed_locally(&mut m);
+}
+
+/// A refused commit must not stop the commit loop: every later participant
+/// still needs its `Commit`, or it is left prepared and holding locks.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_every_participant_is_committed_after_one_refuses() {
+    let (mid_net, _mid_addr) = listening_node().await;
+    let (mut rc_net, rc_addr) = listening_node().await;
+    let (mut other_net, other_addr) = listening_node().await;
+    let mut m = middle_node(mid_net, &rc_addr).await;
+    let (tid, _) = hold_participant_txn(&mut m, &[&rc_addr, &other_addr]);
+
+    // Both refuse, so whichever is sent `Commit` first, the other is only
+    // reached if the loop keeps going after a failure.
+    let (rc_got, other_got) = (Cell::new(false), Cell::new(false));
+    let committed = tokio::select! {
+        biased;
+        c = m.commit_participant(&tid) => c,
+        _ = refuse_commits(&mut rc_net, "rc refused", &rc_got) => {
+            unreachable!("the stand-in for rc runs forever")
+        }
+        _ = refuse_commits(&mut other_net, "other refused", &other_got) => {
+            unreachable!("the other stand-in runs forever")
+        }
+    };
+
+    assert!(
+        rc_got.get() && other_got.get(),
+        "every participant must be sent `Commit` (rc: {}, other: {})",
+        rc_got.get(),
+        other_got.get()
+    );
+    // Which failure is reported depends on the participant set's iteration
+    // order, which means nothing to a caller, so either is accepted.
+    let err = committed
+        .forward_error
+        .expect("a refused commit must be reported")
+        .to_string();
+    assert!(
+        err.contains("rc refused") || err.contains("other refused"),
+        "the error must be one of the participants' reasons, got: {err}"
     );
     assert_committed_locally(&mut m);
 }

@@ -2177,7 +2177,7 @@ impl Manager {
     }
 
     /// Commit a transaction on this node and on every participant, returning
-    /// the first participant's failure to commit
+    /// the first participant's failure to commit (see `commit_participants`)
     ///
     /// Stores this node's writes, commits the participants, and only then
     /// recomputes what derives from the writes. Propagating first would
@@ -2207,7 +2207,7 @@ impl Manager {
     }
 
     /// Send `Commit` to every participant of `txn`, returning the first
-    /// failure
+    /// failure in the set's iteration order, which is arbitrary
     ///
     /// Does not stop at a failure, or the later participants are left
     /// prepared and holding locks
