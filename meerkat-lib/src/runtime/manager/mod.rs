@@ -115,6 +115,20 @@ pub struct Manager {
     pub local_services: Env<'static, ServiceType>,
 }
 
+/// What a participant's `Commit` left behind: the locks it released, and any
+/// failure forwarding that commit to the nodes below it
+///
+/// Not a `Result`: the caller needs both on the failing path. The local commit
+/// is done either way, so a forwarding failure is reported upward, and the
+/// freed locks still have to be woken
+#[derive(Debug, Default)]
+pub struct ParticipantCommit {
+    /// Locks released by this commit, to wake anything parked on them
+    pub freed: HashSet<WaitKey>,
+    /// Failure forwarding `Commit` to a sub-participant
+    pub forward_error: Option<EvalError>,
+}
+
 /// The names of the services a program declares itself.
 ///
 /// These are served locally, so an `-i` flag naming one of them is never
@@ -487,23 +501,11 @@ impl Manager {
 
         // #87: commit on success, abort and roll back on failure (pattern from
         // execute_action_with_txn).
-        // #98: a participant commit can fail after prepare (timeout, etc.).
-        // Store local writes, then attempt every participant commit -- do not
-        // stop at the first failure, or later participants are left prepared --
-        // and remember the first error to surface once init otherwise succeeded.
-        // Propagate only after the participants have committed, the same order
-        // as `execute_action_with_txn`
+        // #98: a participant commit can fail after prepare (timeout, etc.);
+        // remember the first error to surface once init otherwise succeeded.
         let mut commit_error = None;
         if init_error.is_none() {
-            self.store_committed_writes(&txn);
-            for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                if let Err(e) = self.send_commit(addr, &txn.id).await {
-                    if commit_error.is_none() {
-                        commit_error = Some(e);
-                    }
-                }
-            }
-            self.propagate_committed_writes(&txn).await;
+            commit_error = self.commit_txn(&txn).await;
 
             // #24: now that init succeeded, register listener edges so
             // a change to a member notifies the defs that depend on it
@@ -514,11 +516,11 @@ impl Manager {
                 self.update_service_graphs(svc_name, graphs).await;
             }
 
-            // #98: a participant failed to commit after prepare. Roll
-            // the local service back rather than leaving it
-            // half-committed but live: abort participants and remove the
-            // service, mirroring the init-failure path. The captured
-            // error is returned below
+            // #98: a participant failed to commit. Participants here only hold
+            // read locks (initialization never runs actions), so nothing is left
+            // half-applied: remove the service, mirroring the init-failure path,
+            // and abort participants to release any locks still held. The
+            // captured error is returned below
             if commit_error.is_some() {
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     self.send_abort(addr, &txn.id).await;
@@ -2153,41 +2155,39 @@ impl Manager {
                 return Err(exec_error.unwrap());
             }
 
-            if exec_error.is_none() {
-                // Store locally, then commit the participants, and only then
-                // recompute what is derived from the writes. Propagating first
-                // would recompute a def over a remote member while that
-                // member's node is still holding the write buffered, storing a
-                // value that was never true
-                self.store_committed_writes(&txn);
-                for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                    let _ = self.send_commit(addr, &txn.id).await;
+            // A refused commit is reported, not swallowed: on `Ok` the CLI
+            // prints `@test(...) passed` for a transaction only part of which
+            // committed. There is no rollback to offer -- this node's writes
+            // are already stored (#191)
+            let error = match exec_error {
+                None => self.commit_txn(&txn).await,
+                Some(e) => {
+                    for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+                        self.send_abort(addr, &txn.id).await;
+                    }
+                    Some(e)
                 }
-                self.propagate_committed_writes(&txn).await;
-            } else {
-                for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                    self.send_abort(addr, &txn.id).await;
-                }
-            }
+            };
 
             let freed = self.all_locked_keys(&txn);
             self.release_locks(&freed, &txn.id);
 
-            return match exec_error {
-                Some(e) => Err(e),
-                None => Ok(()),
-            };
+            return error.map_or(Ok(()), Err);
         }
     }
 
-    /// Store a committed transaction's buffered writes into the owning
-    /// services and record the writing transaction, without propagating
+    /// Commit a transaction on this node and on every participant, returning
+    /// the first participant's failure to commit (see `commit_participants`)
     ///
-    /// Every commit path calls this, then commits its participants, then
-    /// calls `propagate_committed_writes`. Propagating before the nodes below
-    /// have committed would recompute a def over a remote member while that
-    /// member's write is still buffered
-    fn store_committed_writes(&mut self, txn: &Transaction) {
+    /// Stores this node's writes, commits the participants, and only then
+    /// recomputes what derives from the writes. Propagating first would
+    /// recompute a def over a remote member while that member's node is still
+    /// holding its write buffered, storing a value that was never true
+    ///
+    /// Propagation is best-effort and runs even when a participant failed:
+    /// the writes are stored, so the transaction has committed here and there
+    /// is no way back
+    async fn commit_txn(&mut self, txn: &Transaction) -> Option<EvalError> {
         for ((sid, var), value) in &txn.written {
             if let Some(service) = self.service_by_net_id_mut(sid) {
                 if let Some(var_state) = service.vars.get_mut(var) {
@@ -2196,18 +2196,30 @@ impl Manager {
                 }
             }
         }
-    }
-
-    /// Recompute the members derived from a committed transaction's writes
-    ///
-    /// Best-effort: the transaction has committed and there is no way back
-    async fn propagate_committed_writes(&mut self, txn: &Transaction) {
+        let error = self.commit_participants(txn).await;
         self.forget_participant_deps(txn);
         for (sid, var) in txn.written.keys() {
             if let Some(name) = self.service_name_for_net_id(sid) {
                 self.propagate(name, *var).await;
             }
         }
+        error
+    }
+
+    /// Send `Commit` to every participant of `txn`, returning the first
+    /// failure in the set's iteration order, which is arbitrary
+    ///
+    /// Does not stop at a failure, or the later participants are left
+    /// prepared and holding locks
+    pub(crate) async fn commit_participants(&mut self, txn: &Transaction) -> Option<EvalError> {
+        let mut first_error = None;
+        for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+            if let Err(e) = self.send_commit(addr.clone(), &txn.id).await {
+                log::warn!("participant {} failed to commit: {}", addr.0, e);
+                first_error.get_or_insert(e);
+            }
+        }
+        first_error
     }
 
     /// Drop the cached values of remote members owned by a transaction's
@@ -2272,21 +2284,10 @@ impl Manager {
     }
 
     /// Participant side: apply and release a held transaction on `Commit`
-    pub async fn commit_participant(&mut self, tid: &TxnId) -> Result<HashSet<WaitKey>, EvalError> {
+    pub async fn commit_participant(&mut self, tid: &TxnId) -> ParticipantCommit {
         if let Some(txn) = self.pending_txns.remove(tid) {
             let freed = self.all_locked_keys(&txn);
-            // Same order as the originator in `execute_action_with_txn`: a
-            // node in the middle of a chain may have written locally *and*
-            // composed onto a node below, with a def derived from both. Store,
-            // commit downward, then recompute
-            self.store_committed_writes(&txn);
-            let mut forward_err = None;
-            for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                if let Err(e) = self.send_commit(addr, tid).await {
-                    forward_err = Some(e);
-                }
-            }
-            self.propagate_committed_writes(&txn).await;
+            let forward_error = self.commit_txn(&txn).await;
             // Held until here, like the originator holds its own. Today the
             // event loop is blocked for the whole of this call, so an earlier
             // release would be harmless. That stops being true under #28's
@@ -2295,12 +2296,12 @@ impl Manager {
             // before the nodes below have committed exposes half of a
             // distributed transaction to whoever takes the lock next
             self.release_locks(&freed, &txn.id);
-            match forward_err {
-                Some(e) => Err(e),
-                None => Ok(freed),
+            ParticipantCommit {
+                freed,
+                forward_error,
             }
         } else {
-            Ok(HashSet::new())
+            ParticipantCommit::default()
         }
     }
 

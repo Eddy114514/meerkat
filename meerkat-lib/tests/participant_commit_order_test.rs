@@ -196,9 +196,9 @@ async fn commit_as_participant(m: &mut Manager, rc_net: &mut NetworkActor, rc_ad
         _ = serve_rc(rc_net) => unreachable!("the stand-in for rc runs forever"),
     };
     assert!(
-        committed.is_ok(),
+        committed.forward_error.is_none(),
         "forwarding the commit to rc must succeed: {:?}",
-        committed
+        committed.forward_error
     );
 }
 
