@@ -138,6 +138,37 @@ pub fn local_service_names(prog: &[Stmt]) -> HashSet<Symbol> {
         .collect()
 }
 
+/// The sources a local input of a def reads, as clock dimensions: the vars of
+/// `svc` reached by walking the reactive graph backwards from `input` through
+/// defs. A var is a source itself, so what initialized it is not followed.
+///
+/// `None` when a def on the way also reads a cross-service member, whose own
+/// sources this service's graph cannot see.
+fn local_sources(svc: &Service, input: Symbol) -> Option<HashSet<(Symbol, Symbol)>> {
+    let mut sources = HashSet::new();
+    let mut seen = HashSet::from([input]);
+    let mut stack = vec![input];
+    while let Some(node) = stack.pop() {
+        if svc.graphs.vars.contains(&node) {
+            sources.insert((svc.name, node));
+            continue;
+        }
+        if svc.graphs.cross_deps.contains_key(&node) {
+            return None;
+        }
+        for dep in svc
+            .graphs
+            .reactive_graph
+            .neighbors_directed(node, petgraph::Direction::Incoming)
+        {
+            if seen.insert(dep) {
+                stack.push(dep);
+            }
+        }
+    }
+    Some(sources)
+}
+
 impl Manager {
     pub fn new(interner: Interner) -> Self {
         Manager {
@@ -872,8 +903,9 @@ impl Manager {
     // compute v_target from vector clock semantics 5.3 by taking max over all dependent vector clocks
     // then, determine whether it is glitch-free or not
     fn compute_v_target(&self, curr_svc: &Service, def: &Symbol) -> (VClock, bool) {
-        // get all vclocks of dependencies
-        let mut vclocks: Vec<&VClock> = Vec::new();
+        // get all vclocks of dependencies, each paired with the sources the
+        // gate checks it on (None: every dimension)
+        let mut vclocks = Vec::new();
 
         // ServiceGraphs stores source -> dependent edges. Incoming neighbors
         // are the local inputs previously held in dep.dep_graph[def]; remote
@@ -885,7 +917,7 @@ impl Manager {
                 .neighbors_directed(*def, petgraph::Direction::Incoming)
             {
                 match curr_svc.vars.get(&name) {
-                    Some(vs) => vclocks.push(&vs.vector_clock),
+                    Some(vs) => vclocks.push((&vs.vector_clock, local_sources(curr_svc, name))),
                     None => log::warn!(
                         "gate: local dep '{}' of def '{}' missing from vars",
                         self.interner.get(name),
@@ -901,26 +933,31 @@ impl Manager {
             );
         }
 
-        // cross-service inputs
+        // cross-service inputs. Which sources a remote value was computed from
+        // is not visible here, so these are checked on every dimension.
         if let Some(deps) = curr_svc.dep_cache.get(def) {
             for (_, clk) in deps.values() {
-                vclocks.push(clk);
+                vclocks.push((clk, None));
             }
         }
 
         // compute v_target by taking max over all dependent vector clocks
         let mut v_target: VClock = HashMap::new();
-        for clk in &vclocks {
+        for (clk, _) in &vclocks {
             for (dim, &c) in *clk {
                 let e = v_target.entry(*dim).or_insert(0);
                 *e = (*e).max(c);
             }
         }
-        // gate: every input clock is >= v_target
-        let gate_ok = vclocks.iter().all(|clk| {
-            v_target
-                .iter()
-                .all(|(dim, &t)| clk.get(dim).copied().unwrap_or(0) >= t)
+        // gate: every input clock is >= v_target on each source it reads, so
+        // inputs sharing a source agree on its version. A missing entry is 0,
+        // which is how an input still on a source's initial value lags. An
+        // input is not held back by a dimension of a source it does not read.
+        let gate_ok = vclocks.iter().all(|(clk, sources)| {
+            v_target.iter().all(|(dim, &t)| {
+                sources.as_ref().is_some_and(|s| !s.contains(dim))
+                    || clk.get(dim).copied().unwrap_or(0) >= t
+            })
         });
         (v_target, gate_ok)
     }
