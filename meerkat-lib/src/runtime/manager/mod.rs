@@ -93,6 +93,20 @@ pub struct Manager {
     /// holder (wait-die wait), keyed by the contended WaitKey. Drained
     /// oldest-first when that lock frees on commit or abort.
     pub wait_queue: HashMap<WaitKey, Vec<ParkedRequest>>,
+    /// Locks released since the server loop last looked, on which a request is
+    /// parked waiting to be woken
+    ///
+    /// Every release goes through `release_locks`, which fills this, so no
+    /// failure path can forget to report its keys. A failure surfaces as an
+    /// `EvalError` through call paths with nowhere to put a key set, and
+    /// `handle_lock_request` under `dispatch_network_events` has no dispatcher
+    /// to hand them to at all. The loop drains it with
+    /// `take_freed_awaiting_wake`
+    ///
+    /// Only keys with a waiter are recorded. That keeps it bounded on a node
+    /// with no loop to drain it: a CLI client parks nothing, so it queues
+    /// nothing, even though it can reach the discard path
+    freed_awaiting_wake: HashSet<WaitKey>,
     /// This node's canonical, dialable address, set once after the network is
     /// listening. Service identities are derived from it, so they are stable for
     /// the life of the process (never empty-then-populated) and match the URL
@@ -113,20 +127,6 @@ pub struct Manager {
     pub unified_ast: Vec<Stmt>,
     /// Global local services type environment
     pub local_services: Env<'static, ServiceType>,
-}
-
-/// What a participant's `Commit` left behind: the locks it released, and any
-/// failure forwarding that commit to the nodes below it
-///
-/// Not a `Result`: the caller needs both on the failing path. The local commit
-/// is done either way, so a forwarding failure is reported upward, and the
-/// freed locks still have to be woken
-#[derive(Debug, Default)]
-pub struct ParticipantCommit {
-    /// Locks released by this commit, to wake anything parked on them
-    pub freed: HashSet<WaitKey>,
-    /// Failure forwarding `Commit` to a sub-participant
-    pub forward_error: Option<EvalError>,
 }
 
 /// The names of the services a program declares itself.
@@ -152,6 +152,7 @@ impl Manager {
             node_id: Self::random_node_id(),
             pending_txns: HashMap::new(),
             wait_queue: HashMap::new(),
+            freed_awaiting_wake: HashSet::new(),
             local_address: None,
             local: false,
             interner,
@@ -165,6 +166,12 @@ impl Manager {
     /// Park a request on the wait queue for the contended `WaitKey`
     pub fn park_request_key(&mut self, key: WaitKey, parked: ParkedRequest) {
         self.wait_queue.entry(key).or_default().push(parked);
+    }
+
+    /// Take the locks released since the last call, to wake whatever is
+    /// parked on them. Empty on a quiet loop iteration
+    pub fn take_freed_awaiting_wake(&mut self) -> HashSet<WaitKey> {
+        std::mem::take(&mut self.freed_awaiting_wake)
     }
 
     /// Park a request on the wait queue for the contended `(service, var)`
@@ -548,8 +555,7 @@ impl Manager {
         }
 
         // Release all locks held locally (always, even on error)
-        let freed = self.all_locked_keys(&txn);
-        self.release_locks(&freed, &txn.id);
+        self.release_all_locks(&txn);
 
         let result = match init_error {
             Some(e) => Err(e),
@@ -2080,13 +2086,14 @@ impl Manager {
         keys
     }
 
-    /// Release all locks held by `txn_id` on the given variables (and service locks)
     /// Release all locks (both member and service level) held by a transaction
     pub fn release_all_locks(&mut self, txn: &Transaction) {
         let keys = self.all_locked_keys(txn);
         self.release_locks(&keys, &txn.id);
     }
 
+    /// Release `locked`, recording in `freed_awaiting_wake` the keys a request
+    /// is parked on
     fn release_locks(&mut self, locked: &HashSet<WaitKey>, txn_id: &TxnId) {
         for key in locked {
             match key {
@@ -2106,6 +2113,12 @@ impl Manager {
                 }
             }
         }
+        let waited_on: Vec<WaitKey> = locked
+            .iter()
+            .filter(|k| self.wait_queue.get(k).is_some_and(|w| !w.is_empty()))
+            .cloned()
+            .collect();
+        self.freed_awaiting_wake.extend(waited_on);
     }
 
     /// Execute action statements as a transaction with lazy lock
@@ -2146,8 +2159,7 @@ impl Manager {
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     self.send_abort(addr, &txn.id).await;
                 }
-                let freed = self.all_locked_keys(&txn);
-                self.release_locks(&freed, &txn.id);
+                self.release_all_locks(&txn);
                 if txn_id.iteration < MAX_WAIT_DIE_RETRIES {
                     txn_id = txn_id.retry();
                     continue;
@@ -2169,8 +2181,7 @@ impl Manager {
                 }
             };
 
-            let freed = self.all_locked_keys(&txn);
-            self.release_locks(&freed, &txn.id);
+            self.release_all_locks(&txn);
 
             return error.map_or(Ok(()), Err);
         }
@@ -2284,52 +2295,48 @@ impl Manager {
     }
 
     /// Participant side: apply and release a held transaction on `Commit`
-    pub async fn commit_participant(&mut self, tid: &TxnId) -> ParticipantCommit {
-        if let Some(txn) = self.pending_txns.remove(tid) {
-            let freed = self.all_locked_keys(&txn);
-            let forward_error = self.commit_txn(&txn).await;
-            // Held until here, like the originator holds its own. Today the
-            // event loop is blocked for the whole of this call, so an earlier
-            // release would be harmless. That stops being true under #28's
-            // background message loop, which `send_and_await_reply` is also
-            // waiting on: once other work can interleave here, releasing
-            // before the nodes below have committed exposes half of a
-            // distributed transaction to whoever takes the lock next
-            self.release_locks(&freed, &txn.id);
-            ParticipantCommit {
-                freed,
-                forward_error,
-            }
-        } else {
-            ParticipantCommit::default()
-        }
+    ///
+    /// An error is a failure forwarding the commit to a node below. The local
+    /// commit is done either way, and the freed keys reach the server loop
+    /// through `freed_awaiting_wake`, so they are woken on that path too
+    pub async fn commit_participant(&mut self, tid: &TxnId) -> Result<(), EvalError> {
+        let Some(txn) = self.pending_txns.remove(tid) else {
+            return Ok(());
+        };
+        let forward_error = self.commit_txn(&txn).await;
+        // Held until here, like the originator holds its own. Today the
+        // event loop is blocked for the whole of this call, so an earlier
+        // release would be harmless. That stops being true under #28's
+        // background message loop, which `send_and_await_reply` is also
+        // waiting on: once other work can interleave here, releasing
+        // before the nodes below have committed exposes half of a
+        // distributed transaction to whoever takes the lock next
+        self.release_all_locks(&txn);
+        forward_error.map_or(Ok(()), Err)
     }
 
     /// Centralized cleanup for a participant transaction that encountered a terminal failure
     ///
     /// Releases local locks and aborts all sub-participants before dropping the transaction
     ///
+    /// The freed keys reach the server loop through `freed_awaiting_wake`
+    ///
     /// Args:
     ///     txn (Transaction): The transaction context
-    ///
-    /// Returns:
-    ///     HashSet<WaitKey>: The set of freed wait keys
-    async fn discard_failed_participant_txn(&mut self, txn: Transaction) -> HashSet<WaitKey> {
-        let freed = self.all_locked_keys(&txn);
-        self.release_locks(&freed, &txn.id);
+    async fn discard_failed_participant_txn(&mut self, txn: Transaction) {
+        self.release_all_locks(&txn);
         for addr in txn.participants {
             self.send_abort(addr, &txn.id).await;
         }
-        freed
     }
 
     /// Participant side: discard and release a held transaction on `Abort`, and
     /// forward the abort down the chain to any sub-participants
-    pub async fn abort_participant(&mut self, tid: &TxnId) -> HashSet<WaitKey> {
+    ///
+    /// The freed keys reach the server loop through `freed_awaiting_wake`
+    pub async fn abort_participant(&mut self, tid: &TxnId) {
         if let Some(txn) = self.pending_txns.remove(tid) {
-            self.discard_failed_participant_txn(txn).await
-        } else {
-            HashSet::new()
+            self.discard_failed_participant_txn(txn).await;
         }
     }
 
@@ -2436,8 +2443,7 @@ impl Manager {
             // ensuring the transaction yields completely and retries
             // from scratch when unparked
             Err(EvalError::WaitOn(key)) => {
-                let freed = self.all_locked_keys(&txn);
-                self.release_locks(&freed, &txn.id);
+                self.release_all_locks(&txn);
                 txn.locked.clear();
                 txn.service_locked.clear();
 
@@ -4212,8 +4218,10 @@ mod tests {
             },
         );
 
-        // The younger holder aborts, freeing `x`
-        let freed = tc.manager.abort_participant(&younger).await;
+        // The younger holder aborts, freeing `x`. The released keys reach the
+        // caller through `take_freed_awaiting_wake`
+        tc.manager.abort_participant(&younger).await;
+        let freed = tc.manager.take_freed_awaiting_wake();
         assert!(matches!(
             tc.manager
                 .services
@@ -4604,5 +4612,230 @@ mod tests {
         let res = manager.handle_lock_request(txn_id, services).await;
         assert!(res.is_err());
         assert!(matches!(res, Err(EvalError::RuntimeError(_))));
+    }
+
+    /// `x = x + 1`
+    fn incr_x(tc: &TestContext) -> ActionStmt {
+        ActionStmt::Assign {
+            name: tc.x,
+            expr: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::Variable { name: tc.x }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Int { val: 1 },
+                }),
+            },
+        }
+    }
+
+    /// A read of `foo.member` by some transaction, as it sits on the wait queue
+    fn parked_lookup(tc: &TestContext, member: Symbol) -> ParkedRequest {
+        ParkedRequest::Lookup {
+            request_id: 1,
+            reply_to: String::new(),
+            service: tc.foo,
+            member,
+            tid: TxnId::new(tc.manager.node_id),
+        }
+    }
+
+    /// The freed-key queue holds only keys something is actually parked on.
+    ///
+    /// A key nothing waits on has nothing to wake, and on a node that never
+    /// parks anything it would be an entry that is never drained. A CLI client
+    /// is exactly that node: it serves a `LockRequest` inline from
+    /// `dispatch_network_events` while awaiting some other reply, so it can
+    /// reach the discard path, but it has no loop to drain the queue.
+    #[tokio::test]
+    async fn test_freed_keys_are_queued_only_when_something_is_parked_on_them() {
+        let mut tc = manager_with_x().await;
+        let key = WaitKey::Member(tc.manager.service_net_id_for_name(tc.foo), tc.x);
+
+        // Locks `x`, then fails terminally, so `x` is released.
+        let stmts = vec![
+            incr_x(&tc),
+            ActionStmt::Assert(
+                Expr::Literal {
+                    val: Value::Bool { val: false },
+                },
+                "always fails".to_string(),
+            ),
+        ];
+        let tid = TxnId::new(tc.manager.node_id);
+        tc.manager
+            .execute_action_participant(tc.foo, &stmts, &[], tid)
+            .await
+            .expect_err("the assertion fails the action");
+        assert!(
+            tc.manager.take_freed_awaiting_wake().is_empty(),
+            "nothing is parked on `x`, so its release must not be queued"
+        );
+
+        // With a waiter, the same failure queues exactly that key.
+        let parked = parked_lookup(&tc, tc.x);
+        tc.manager.park_request_key(key.clone(), parked);
+        let tid = TxnId::new(tc.manager.node_id);
+        tc.manager
+            .execute_action_participant(tc.foo, &stmts, &[], tid)
+            .await
+            .expect_err("the assertion fails the action");
+        assert_eq!(
+            tc.manager.take_freed_awaiting_wake(),
+            HashSet::from([key]),
+            "a request is parked on `x`, so its release must be queued for waking"
+        );
+    }
+
+    /// A commit reports its freed keys through the deferred queue, like every
+    /// other release, and each key is delivered once.
+    ///
+    /// Two deliveries of one key would wake two waiters: the second wake fires
+    /// while the first waiter is holding the lock it was just handed, and
+    /// wait-die kills the second rather than leaving it parked.
+    #[tokio::test]
+    async fn test_commit_reports_its_freed_keys_once() {
+        let mut tc = manager_with_x().await;
+        let key = WaitKey::Member(tc.manager.service_net_id_for_name(tc.foo), tc.x);
+
+        // A prepared participant transaction holding the write lock on `x`.
+        let holder = TxnId::new(tc.manager.node_id);
+        tc.manager
+            .execute_action_participant(tc.foo, &[incr_x(&tc)], &[], holder.clone())
+            .await
+            .unwrap();
+
+        // Two waiters parked behind it, oldest first.
+        let parked_action = |timestamp| ParkedRequest::Action {
+            request_id: 1,
+            reply_to: String::new(),
+            service: tc.foo,
+            stmts: vec![incr_x(&tc)],
+            env: vec![],
+            tid: TxnId {
+                timestamp,
+                node_id: tc.manager.node_id,
+                iteration: 0,
+            },
+        };
+        let (first, second) = (parked_action(1), parked_action(2));
+        let first_tid = first.tid().clone();
+        tc.manager.park_request_key(key.clone(), first);
+        tc.manager.park_request_key(key.clone(), second);
+
+        // The server loop commits, then wakes what the queue reports.
+        tc.manager.commit_participant(&holder).await.unwrap();
+        let freed = tc.manager.take_freed_awaiting_wake();
+        assert!(freed.contains(&key), "the commit released `x`");
+
+        // Waking serves the oldest waiter, which takes the lock.
+        let ready = tc.manager.take_ready_waiters(&freed);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].tid(), &first_tid);
+        tc.manager
+            .execute_action_participant(tc.foo, &[incr_x(&tc)], &[], first_tid)
+            .await
+            .expect("the freed lock is now the first waiter's");
+        assert!(
+            tc.manager.take_freed_awaiting_wake().is_empty(),
+            "the key was taken once already; a second delivery would wake the \
+             younger waiter against the lock the first one now holds"
+        );
+        assert_eq!(
+            tc.manager.wait_queue.get(&key).map(|w| w.len()),
+            Some(1),
+            "the younger waiter must stay parked until the new holder commits"
+        );
+    }
+
+    /// A service with two independent vars, `a` and `x`
+    async fn manager_with_a_and_x() -> TestContext {
+        let mut tc = TestContext::new();
+        let a = tc.manager.interner.insert("a");
+        let zero = || Expr::Literal {
+            val: Value::Int { val: 0 },
+        };
+        let decls = vec![
+            Decl::VarDecl {
+                name: a,
+                ty: None,
+                val: zero(),
+            },
+            Decl::VarDecl {
+                name: tc.x,
+                ty: None,
+                val: zero(),
+            },
+        ];
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        tc
+    }
+
+    /// Every lock an originator transaction releases has to be reported for
+    /// waking, on the ordinary path as much as the failing one.
+    #[tokio::test]
+    async fn test_originator_reports_locks_released_on_success() {
+        let mut tc = manager_with_x().await;
+        let key = WaitKey::Member(tc.manager.service_net_id_for_name(tc.foo), tc.x);
+        let parked = parked_lookup(&tc, tc.x);
+        tc.manager.park_request_key(key.clone(), parked);
+
+        tc.manager
+            .execute_action(tc.foo, &[incr_x(&tc)])
+            .await
+            .expect("an uncontended write commits");
+
+        assert!(
+            tc.manager.take_freed_awaiting_wake().contains(&key),
+            "the committed transaction released its write lock on `x`, so the \
+             request parked on it must be reported for waking"
+        );
+    }
+
+    /// The same when the originator gives up on a contended lock, releasing
+    /// what the attempt had already locked.
+    #[tokio::test]
+    async fn test_originator_reports_locks_released_when_it_gives_up() {
+        let mut tc = manager_with_a_and_x().await;
+        let a = tc.manager.interner.insert("a");
+        let key_a = WaitKey::Member(tc.manager.service_net_id_for_name(tc.foo), a);
+
+        // A younger transaction holds `x` for the whole run.
+        tc.manager
+            .services
+            .get_mut(&tc.foo)
+            .unwrap()
+            .vars
+            .get_mut(&tc.x)
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(TxnId {
+            timestamp: u128::MAX,
+            node_id: tc.manager.node_id,
+            iteration: 0,
+        });
+
+        // Someone is parked on `a`, which the transaction locks before it
+        // contends on `x`.
+        let parked = parked_lookup(&tc, a);
+        tc.manager.park_request_key(key_a.clone(), parked);
+
+        let stmts = vec![
+            ActionStmt::Assign {
+                name: a,
+                expr: Expr::Literal {
+                    val: Value::Int { val: 1 },
+                },
+            },
+            incr_x(&tc),
+        ];
+        tc.manager
+            .execute_action(tc.foo, &stmts)
+            .await
+            .expect_err("`x` is held for the whole run");
+
+        assert!(
+            tc.manager.take_freed_awaiting_wake().contains(&key_a),
+            "the attempt released the lock it had taken on `a`, so the request \
+             parked on it must be reported for waking"
+        );
     }
 }
