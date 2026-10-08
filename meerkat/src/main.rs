@@ -998,17 +998,22 @@ async fn run_server(
                     source_service,
                     member,
                     value,
+                    clock,
                 } => {
                     // #24: validate + intern wire names through codec; skip on bad input.
-                    let (listener_def_sym, source_sym, member_sym) = match codec::decode_update(
-                        &listener_def,
-                        &source_service,
-                        &member,
-                        &mut manager.interner,
-                    ) {
-                        Ok(syms) => syms,
-                        Err(_) => continue,
-                    };
+                    // Vector-clock PR: the clock's dimension names are interned here
+                    // too, so a bad one drops the whole message.
+                    let (listener_def_sym, source_sym, member_sym, vclock) =
+                        match codec::decode_update(
+                            &listener_def,
+                            &source_service,
+                            &member,
+                            &mut manager.interner,
+                            clock,
+                        ) {
+                            Ok(syms) => syms,
+                            Err(_) => continue,
+                        };
                     manager
                         .handle_update(
                             ServiceNetId(listener_service),
@@ -1016,6 +1021,7 @@ async fn run_server(
                             source_sym,
                             member_sym,
                             value,
+                            vclock,
                         )
                         .await;
                 }
@@ -1203,6 +1209,7 @@ async fn run_client(
                 source_service,
                 member,
                 value,
+                clock,
             }) = msg
             {
                 if let Ok(parsed) = codec::decode_value(value.clone(), &mut manager.interner) {
@@ -1210,17 +1217,20 @@ async fn run_client(
                 }
                 let lid = ServiceNetId(listener_service);
                 // #24: validate + intern wire names through codec; skip on bad input.
-                let (def_sym, source_sym, member_sym) = match codec::decode_update(
+                // Vector-clock PR: the clock's dimension names are interned here
+                // too, so a bad one drops the whole message.
+                let (def_sym, source_sym, member_sym, vclock) = match codec::decode_update(
                     &listener_def,
                     &source_service,
                     &member,
                     &mut manager.interner,
+                    clock,
                 ) {
                     Ok(syms) => syms,
                     Err(_) => continue,
                 };
                 manager
-                    .handle_update(lid.clone(), def_sym, source_sym, member_sym, value)
+                    .handle_update(lid.clone(), def_sym, source_sym, member_sym, value, vclock)
                     .await;
                 if let Some((_, svc)) = manager.services.iter().find(|(_, s)| s.id == lid) {
                     if let Some(vs) = svc.vars.get(&def_sym) {
