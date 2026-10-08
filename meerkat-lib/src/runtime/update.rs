@@ -459,6 +459,7 @@ impl Transaction {
                             value: val,
                             lock: VarLock::Unlocked,
                             latest_write_txn: None,
+                            vector_clock: HashMap::new(),
                         },
                     );
                 }

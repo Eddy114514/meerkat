@@ -223,7 +223,7 @@ async fn test_propagation_does_not_use_cached_participant_values() {
         .dep_cache
         .entry(mid_view)
         .or_default()
-        .insert((rc, gc), Value::Int { val: 1 });
+        .insert((rc, gc), (Value::Int { val: 1 }, HashMap::new()));
 
     commit_as_participant(&mut m, &mut rc_net, &rc_addr).await;
     assert_committed_and_recomputed(&mut m);

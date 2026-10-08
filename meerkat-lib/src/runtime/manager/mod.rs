@@ -838,53 +838,6 @@ impl Manager {
         v_base
     }
 
-    // helper function to get the vector clock for a particular var def
-    fn get_clock(&self, service_name: &Symbol, var: &Symbol) -> Option<&VClock> {
-        let svc = self.services.get(service_name)?;
-        let vars = svc.vars.get(var)?;
-        Some(&vars.vector_clock)
-    }
-
-    // helper function to apply a simultaneous bump, as described in section 5.2 of vector clock semantics
-    fn simultaneous_bump(
-        &mut self,
-        read_set: &HashSet<(Symbol, Symbol)>,
-        write_set: &HashSet<(Symbol, Symbol)>,
-    ) -> VClock {
-        let mut vclocks: Vec<&VClock> = Vec::new();
-        // get all the vclocks first
-        for (svc, var) in read_set.union(write_set) {
-            match self.get_clock(svc, var) {
-                Some(clock) => vclocks.push(clock),
-                None => {
-                    log::warn!(
-                        "simultaneous_bump: clock for var {} in service {} not found",
-                        self.interner.get(*var),
-                        self.interner.get(*svc)
-                    );
-                }
-            }
-        }
-        // compute the max over all vclocks
-        let mut v_base: VClock = HashMap::new();
-        for clk in &vclocks {
-            for (dim, &c) in *clk {
-                let e = v_base.entry(*dim).or_insert(0);
-                *e = (*e).max(c);
-            }
-        }
-        // increment if they're in the write_set
-        for (svc, var) in write_set {
-            *v_base.entry((*svc, *var)).or_insert(0) += 1;
-        }
-        for (svc, var) in write_set {
-            if let Some(vs) = self.services.get_mut(svc).and_then(|s| s.vars.get_mut(var)) {
-                vs.vector_clock = v_base.clone(); // write the new base vector clock back to everything in the write set
-            }
-        }
-        v_base
-    }
-
     pub(crate) async fn propagate(&mut self, service_name: Symbol, changed_var: Symbol) {
         // #24: event-driven reactivity over the listener graph. A change to a
         // member notifies its listeners. For each listener we resolve its
@@ -931,25 +884,21 @@ impl Manager {
         // get all vclocks of dependencies
         let mut vclocks: Vec<&VClock> = Vec::new();
 
-        // local inputs
-        match curr_svc.dep.dep_graph.get(def) {
-            Some(local_deps) => {
-                for name in local_deps {
-                    match curr_svc.vars.get(name) {
-                        Some(vs) => vclocks.push(&vs.vector_clock),
-                        None => log::warn!(
-                            "gate: local dep '{}' of def '{}' missing from vars",
-                            self.interner.get(*name),
-                            self.interner.get(*def),
-                        ),
-                    }
-                }
+        // ServiceGraphs stores source -> dependent edges. Incoming reactive
+        // neighbors are the local inputs formerly held in dep.dep_graph[def].
+        for name in curr_svc
+            .graphs
+            .reactive_graph
+            .neighbors_directed(*def, petgraph::Direction::Incoming)
+        {
+            match curr_svc.vars.get(&name) {
+                Some(vs) => vclocks.push(&vs.vector_clock),
+                None => log::warn!(
+                    "gate: local dep '{}' of def '{}' missing from vars",
+                    self.interner.get(name),
+                    self.interner.get(*def),
+                ),
             }
-            None => log::warn!(
-                "gate: def '{}' missing from dep_graph in service '{}'",
-                self.interner.get(*def),
-                self.interner.get(curr_svc.name),
-            ),
         }
 
         // cross-service inputs
@@ -2109,6 +2058,7 @@ impl Manager {
             value: Value::Int { val: 0 },
             lock: crate::runtime::txn::VarLock::Unlocked,
             latest_write_txn: None,
+            vector_clock: HashMap::new(),
         });
         if var_state.lock.try_write(txn_id) {
             Ok(())
@@ -2399,7 +2349,9 @@ impl Manager {
             .collect();
         // for now, we don't need the resulting v_base, but we will in the future
         self.simultaneous_bump(&read_set, &write_set); // returns V_new; discarded in M1
-        for ((sid, var), _) in &writes {
+        let error = self.commit_participants(txn).await;
+        self.forget_participant_deps(txn);
+        for (sid, var) in txn.written.keys() {
             if let Some(name) = self.service_name_for_net_id(sid) {
                 self.propagate(name, *var).await;
             }
