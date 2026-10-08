@@ -492,6 +492,7 @@ def integration_tests():
         ("action_cross_node",         make_mkn_test(f"{IDIR}/imports/action/action.json")),
         ("file_imports",              make_mkn_test(f"{IDIR}/imports/file_imports/file_imports.json")),
         ("mixed_imports",             make_mkn_test(f"{IDIR}/imports/mixed_imports/mixed_imports.json")),
+        ("server_file_imports",       make_mkn_test(f"{IDIR}/imports/server_file_imports/server_file_imports.json")),
         ("rejection_imports",         make_mkn_test(f"{IDIR}/imports/rejection_imports/rejection_imports.json",
                                                     expect_fail="Unknown identifier")),
         ("circular_imports",          make_mkn_test(f"{IDIR}/imports/circular_imports/circular_imports.json",

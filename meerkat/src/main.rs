@@ -8,20 +8,17 @@ use meerkat_lib::net::{
     codec, Address, MeerkatMessage, NetworkCommand, NetworkEvent, NetworkReply, ServiceNetId,
 };
 use meerkat_lib::runtime::ast::{AstPrinter, Stmt};
-use meerkat_lib::runtime::interner::Interner;
+use meerkat_lib::runtime::interner::{Interner, Symbol};
 use meerkat_lib::runtime::interpreter::EvalError;
 use meerkat_lib::runtime::manager::ParkedRequest;
-use meerkat_lib::runtime::txn::WaitKey;
 use meerkat_lib::runtime::{parser, Manager, Node};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 
 #[cfg(debug_assertions)]
 use meerkat_lib::net::types::LockGroup;
 #[cfg(debug_assertions)]
 use meerkat_lib::runtime::txn::TxnId;
-#[cfg(debug_assertions)]
-use std::collections::HashMap;
 
 /// #151: load a persistent libp2p identity keypair from `path`, or create and
 /// save one if the file does not yet exist. Using the same file across runs
@@ -153,6 +150,23 @@ struct Args {
     test_locks: Option<String>,
 }
 
+/// Build the slug -> remote address map the runtime registers `-i` flags from.
+///
+/// A service URL is a node address with the service's slug appended, so the
+/// final path segment names the service the URL serves.
+///
+/// Args:
+///     import_urls (&[String]): Raw `-i <url>` values.
+///
+/// Returns:
+///     HashMap<String, String>: Service slug to the URL serving it.
+fn remote_url_map(import_urls: &[String]) -> HashMap<String, String> {
+    import_urls
+        .iter()
+        .filter_map(|url| Some((url.split('/').next_back()?.to_string(), url.clone())))
+        .collect()
+}
+
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
@@ -174,14 +188,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         .filter_level(log_level)
         .init();
 
-    // Build slug -> remote address map from -i flags
-    let mut remote_url_map: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for url in &args.import_urls {
-        if let Some(slug) = url.split('/').next_back() {
-            remote_url_map.insert(slug.to_string(), url.clone());
-        }
-    }
+    let mut remote_url_map = remote_url_map(&args.import_urls);
 
     let mut node = Node::new();
 
@@ -246,6 +253,11 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             .static_checks()
             .map_err(|e| format!("Static check error: {}", e))?;
 
+            // `run_server` and `run_client` build their `Manager` directly
+            // rather than through `Node::on_manager_startup`, so they need
+            // the peers discovered during resolution merged in here.
+            node.merge_discovered_remote_services(&mut remote_url_map);
+
             // This mode must appear before `server` args check in
             // order to properly stop execution. Logic for static
             // checks must not occur in this branch, as the intent
@@ -264,14 +276,9 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 let server_addr = opt_server_addr
                     .expect("Server address should be initialized when args.server is true");
 
-                let target_ast = if remote_url_map.is_empty() {
-                    node.unified_ast.clone()
-                } else {
-                    prog
-                };
-
                 run_server(
-                    target_ast,
+                    node.unified_ast.clone(),
+                    prog,
                     file,
                     remote_url_map,
                     ServerConfig {
@@ -288,7 +295,6 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 run_client(
                     node.unified_ast.clone(),
                     prog,
-                    file,
                     remote_url_map,
                     args.local,
                     args.watch,
@@ -310,11 +316,17 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// Run a participant request (initial dispatch or a woken waiter) and either
-/// send its reply, or, if the requesting transaction is older than a current
-/// lock holder (wait-die), park it on the contended variable's queue to be
-/// re-run when that lock frees.
+/// Run a participant request (initial dispatch or a woken waiter), then wake
+/// whatever is parked on locks it released
 async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
+    dispatch_parked(manager, parked).await;
+    wake_freed(manager).await;
+}
+
+/// Run a participant request and either send its reply, or, if the requesting
+/// transaction is older than a current lock holder (wait-die), park it on the
+/// contended variable's queue to be re-run when that lock frees.
+async fn dispatch_parked(manager: &mut Manager, parked: ParkedRequest) {
     match parked {
         ParkedRequest::Action {
             request_id,
@@ -447,11 +459,13 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
     }
 }
 
-/// After a holder releases its locks on commit or abort, re-dispatch the parked
-/// requests waiting on the freed variables, oldest first.
-async fn wake_ready(manager: &mut Manager, freed: HashSet<WaitKey>) {
+/// Re-dispatch the requests parked on locks released since the last call
+/// (`Manager::take_freed_awaiting_wake`), oldest first
+async fn wake_freed(manager: &mut Manager) {
+    let freed = manager.take_freed_awaiting_wake();
     for parked in manager.take_ready_waiters(&freed) {
-        run_and_reply_or_park(manager, parked).await;
+        // Boxed: this and `run_and_reply_or_park` are mutually recursive
+        Box::pin(run_and_reply_or_park(manager, parked)).await;
     }
 }
 
@@ -474,7 +488,87 @@ struct ServerConfig {
     identity: Option<std::path::PathBuf>,
 }
 
+/// Populate a server `Manager` with the program's services: the unified AST,
+/// the configured remote services and the locally resolved imports, then the
+/// services this program declares itself, in program order.
+///
+/// Split out of `run_server` so that this sequence can be tested without
+/// standing up a network or entering the event loop. It is the part of server
+/// startup that has no network dependency of its own -- the caller wires the
+/// network into `manager` first, because instantiating a service may issue a
+/// remote lookup.
+///
+/// `full_ast` is the dependency-ordered AST of this program plus everything it
+/// imports, and must be kept distinct from `prog`. Server mode once passed the
+/// program alone whenever any `-i` flag was present, which silently dropped
+/// every import and left services that read one failing with `ServiceNotFound`.
+async fn init_server_services(
+    manager: &mut Manager,
+    full_ast: Vec<Stmt>,
+    prog: &[Stmt],
+    remote_url_map: &std::collections::HashMap<String, String>,
+) -> Result<(), Box<dyn Error>> {
+    // `register_and_instantiate_imports` walks this, and runtime updates
+    // against remote services resolve their targets through it.
+    manager.unified_ast = full_ast;
+
+    manager
+        .register_and_instantiate_imports(prog, remote_url_map)
+        .await
+        .map_err(|e| format!("Import service error: {}", e))?;
+
+    for stmt in prog {
+        if let Stmt::Service { name, decls } = stmt {
+            manager
+                .create_service(*name, decls.clone())
+                .await
+                .map_err(|e| format!("Service error: {}", e))?;
+            println!("Service '{}' loaded", manager.interner.get(*name));
+        }
+    }
+    Ok(())
+}
+
+/// The services this node advertises a `Service URL` for.
+///
+/// Driven by the services the manager actually instantiated, not by the
+/// program text: a locally resolved import is served here and so is
+/// advertised, while a service an `-i` flag points at a peer is not. Server
+/// mode once listed the root program alone, which left an imported service
+/// reachable but undiscoverable -- `scripts/mkn.py` learns a node's services
+/// from these lines and nothing else, so a topology whose server hosts a
+/// service via its own `import` failed to launch.
+///
+/// Walked in `unified_ast` order -- imports first, then the program's own
+/// services -- so the output is deterministic for those scrapers.
+///
+/// Args:
+///     manager (&Manager): Manager whose services have been instantiated.
+///
+/// Returns:
+///     Vec<Symbol>: Services to advertise, in advertisement order.
+fn advertised_services(manager: &Manager) -> Vec<Symbol> {
+    let mut seen = HashSet::new();
+    manager
+        .unified_ast
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Service { name, .. } => Some(*name),
+            _ => None,
+        })
+        .filter(|name| manager.services.contains_key(name) && seen.insert(*name))
+        .collect()
+}
+
+/// Print a `Service URL` line for each of `advertised_services`.
+fn print_service_urls(manager: &Manager, full_addr: &str) {
+    for name in advertised_services(manager) {
+        println!("Service URL: {}/{}", full_addr, manager.interner.get(name));
+    }
+}
+
 async fn run_server(
+    full_ast: Vec<Stmt>,
     prog: Vec<Stmt>,
     input_file: &str,
     remote_url_map: std::collections::HashMap<String, String>,
@@ -552,39 +646,17 @@ async fn run_server(
     let ws_full_addr = format!("{}/p2p/{}", actual_ws_addr_str, peer_id);
     println!("Browser clients connect at: {}", ws_full_addr);
 
-    // Print service URLs
-    for stmt in &prog {
-        if let Stmt::Service { name, .. } = stmt {
-            println!("Service URL: {}/{}", full_addr, manager.interner.get(*name));
-        }
-    }
-
-    // Register any remote services from -i flags
-    for (svc_name, url) in &remote_url_map {
-        let svc_sym = manager.interner.insert(svc_name);
-        manager
-            .remote_services
-            .insert(svc_sym, Address::new(url.as_str()));
-        println!("Remote service '{}' registered at {}", svc_name, url);
-    }
-
     // Wire network into manager so server can also do remote lookups
     manager.network = Some(net);
     // Record the canonical address so service identities are stable and match
-    // the advertised Service URLs above.
+    // the advertised Service URLs below.
     manager.set_local_address(full_addr.clone());
 
-    // Load services after network and remote services are ready,
-    // so that remote lookups during service initialization work correctly
-    for stmt in &prog {
-        if let Stmt::Service { name, decls } = stmt {
-            manager
-                .create_service(*name, decls.clone())
-                .await
-                .map_err(|e| format!("Service error: {}", e))?;
-            println!("Service '{}' loaded", manager.interner.get(*name));
-        }
-    }
+    // Called after the network is wired, so that remote lookups during
+    // service initialization work correctly.
+    init_server_services(&mut manager, full_ast, &prog, &remote_url_map).await?;
+
+    print_service_urls(&manager, &full_addr);
 
     println!("Server running, press Ctrl+C to stop...");
 
@@ -598,6 +670,11 @@ async fn run_server(
 
     let mut last_keepalive = tokio::time::Instant::now();
     loop {
+        // Wake what is parked on locks released with no dispatcher to hand the
+        // keys to, e.g. by a `LockRequest` served inline while
+        // `send_and_await_reply` pumped events during the last iteration
+        wake_freed(&mut manager).await;
+
         // Defer pending service updates so that network events can be processed
         // without blocking the server loop during multi-step updates
         if let Some((request_id, txn_id, source, reply_to, peer)) = pending_updates.pop_front() {
@@ -818,10 +895,6 @@ async fn run_server(
                     reply_to,
                 } => {
                     let result = manager.commit_participant(&txn_id).await;
-                    let freed = match &result {
-                        Ok(f) => f.clone(),
-                        Err(_) => HashSet::new(),
-                    };
                     let response = MeerkatMessage::CommitResponse {
                         request_id,
                         success: result.is_ok(),
@@ -831,15 +904,15 @@ async fn run_server(
                         send_net_msg(net, &reply_to, response).await;
                     }
                     // Wake transactions that were waiting on locks this
-                    // commit just released.
-                    wake_ready(&mut manager, freed).await;
+                    // commit just released, even if forwarding it failed.
+                    wake_freed(&mut manager).await;
                 }
                 MeerkatMessage::Abort {
                     request_id,
                     txn_id,
                     reply_to,
                 } => {
-                    let freed = manager.abort_participant(&txn_id).await;
+                    manager.abort_participant(&txn_id).await;
                     // Drop this transaction's own parked requests so they
                     // do not later wake for an abandoned transaction.
                     manager.purge_parked_txn(&txn_id);
@@ -853,7 +926,7 @@ async fn run_server(
                     }
                     // Wake transactions that were waiting on locks this
                     // abort just released.
-                    wake_ready(&mut manager, freed).await;
+                    wake_freed(&mut manager).await;
                 }
                 // Incoming LockRequest from a remote originator node.
                 // Wraps the request as a `ParkedRequest::Lock` and
@@ -997,7 +1070,6 @@ async fn run_server(
 async fn run_client(
     full_ast: Vec<Stmt>,
     prog: Vec<Stmt>,
-    input_file: &str,
     remote_url_map: std::collections::HashMap<String, String>,
     local: bool,
     watch: bool,
@@ -1047,6 +1119,13 @@ async fn run_client(
         manager.set_local_address(addr);
     }
 
+    // Register the -i remotes and build the imported services, before any of
+    // this program's own.
+    manager
+        .register_and_instantiate_imports(&prog, &remote_url_map)
+        .await
+        .map_err(|e| format!("Import service error: {}", e))?;
+
     for stmt in &prog {
         match stmt {
             &Stmt::Service { name, ref decls } => {
@@ -1086,7 +1165,7 @@ async fn run_client(
                 // Watch mode only observes; it does not run @test actions.
                 if !watch {
                     manager
-                        .execute_action(service_name, stmts)
+                        .execute_test_block(service_name, stmts)
                         .await
                         .map_err(|e| {
                             format!(
@@ -1098,37 +1177,10 @@ async fn run_client(
                     println!("@test({}) passed", manager.interner.get(service_name));
                 }
             }
-            &Stmt::Import {
-                ref path,
-                service_name,
-            } => {
-                if let Some(url) = remote_url_map.get(manager.interner.get(service_name)) {
-                    manager
-                        .remote_services
-                        .insert(service_name, Address::new(url.as_str()));
-                    println!(
-                        "Remote service '{}' registered at {}",
-                        manager.interner.get(service_name),
-                        url
-                    );
-                } else {
-                    let base_dir = std::path::Path::new(input_file)
-                        .parent()
-                        .unwrap_or(std::path::Path::new("."));
-                    let import_path = base_dir.join(path);
-                    let import_stmts =
-                        parser::parse_file(import_path.to_str().unwrap(), &mut manager.interner)
-                            .map_err(|e| format!("Import parse error: {}", e))?;
-                    for import_stmt in &import_stmts {
-                        if let &Stmt::Service { name, ref decls } = import_stmt {
-                            manager
-                                .create_service(name, decls.clone())
-                                .await
-                                .map_err(|e| format!("Import service error: {}", e))?;
-                            println!("Imported service '{}'", manager.interner.get(name));
-                        }
-                    }
-                }
+            Stmt::Import { path, .. } => {
+                // Remote services were registered, and local imports
+                // instantiated, before this loop started.
+                let _ = path;
             }
             &Stmt::ActionStmt(_) | &Stmt::Connect { .. } | &Stmt::Watch { .. } => {}
         }
@@ -1220,15 +1272,10 @@ async fn run_lock_test_client(
     manager.network = Some(net);
 
     // Register all remote service urls from the -i flags so the
-    // manager can resolve service names to network addresses.
-    for url in import_urls {
-        if let Some(slug) = url.split('/').next_back() {
-            let sym = manager.interner.insert(slug);
-            manager
-                .remote_services
-                .insert(sym, Address::new(url.clone()));
-        }
-    }
+    // manager can resolve service names to network addresses. This client
+    // runs no program of its own, so no slug can collide with a local
+    // declaration.
+    manager.register_remote_services(&remote_url_map(import_urls), &HashSet::new());
 
     match test_case {
         // Test: cascade_lock_success
@@ -1538,6 +1585,7 @@ fn exceeds_pending_update_limit(
 mod tests {
     use super::*;
     use meerkat_lib::net::MessageId;
+    use meerkat_lib::runtime::txn::{TxnId, WaitKey};
 
     #[test]
     fn listen_success_addr_returns_bound_address() {
@@ -1597,6 +1645,279 @@ mod tests {
         assert!(
             !exceeds_pending_update_limit(&queue, "peer2"),
             "Should allow new updates from different peers"
+        );
+    }
+
+    /// `-i` slugs come from the URL's final path segment, and each slug maps
+    /// back to the whole URL.
+    #[test]
+    fn remote_url_map_keys_on_the_final_path_segment() {
+        let urls = vec![
+            "/ip4/127.0.0.1/tcp/9000/p2p/12D3xyz/s1".to_string(),
+            "/ip4/127.0.0.1/tcp/9001/p2p/12D3abc/s2".to_string(),
+        ];
+
+        let map = remote_url_map(&urls);
+
+        assert_eq!(map.get("s1"), Some(&urls[0]));
+        assert_eq!(map.get("s2"), Some(&urls[1]));
+        assert_eq!(map.len(), 2);
+    }
+
+    /// A server advertises a `Service URL` for the imports it resolved
+    /// locally, not only for the services its own file declares.
+    ///
+    /// The regression this guards: `run_server` listed the root program while
+    /// `init_server_services` went on creating the imports too, so an
+    /// imported service was served and reachable but never announced.
+    /// `scripts/mkn.py` discovers a node's services from those lines alone, so
+    /// a topology whose server hosts a service via its own `import` stopped
+    /// launching ("imports missing service ... from online node").
+    #[tokio::test]
+    async fn advertised_services_covers_locally_resolved_imports() {
+        let mut interner = Interner::new();
+        let (full, prog) = server_asts(&mut interner);
+        let app = interner.insert("app");
+        let dep = interner.insert("dep");
+
+        let mut manager = Manager::new(interner);
+        manager.local = true;
+        init_server_services(&mut manager, full, &prog, &HashMap::new())
+            .await
+            .expect("server startup succeeds");
+
+        assert_eq!(
+            advertised_services(&manager),
+            vec![dep, app],
+            "both the import and the program's own service are served here, \
+             and in dependency order"
+        );
+    }
+
+    /// A service an `-i` flag points at a peer is served there, not here, so
+    /// this node must not advertise a URL of its own for it.
+    ///
+    /// `app` does not read `dep` here: reading a remote service needs a live
+    /// network layer, which this test deliberately does without.
+    #[tokio::test]
+    async fn advertised_services_omits_remotely_served_services() {
+        let mut interner = Interner::new();
+        let full = parser::parse_string(
+            "service dep { var x = 1; } service app { var y = 2; }",
+            &mut interner,
+        )
+        .expect("fixture parses");
+        let prog = parser::parse_string("service app { var y = 2; }", &mut interner)
+            .expect("fixture parses");
+        let app = interner.insert("app");
+
+        let mut remotes = HashMap::new();
+        remotes.insert("dep".to_string(), "/ip4/127.0.0.1/tcp/9000/dep".to_string());
+
+        let mut manager = Manager::new(interner);
+        manager.local = true;
+        init_server_services(&mut manager, full, &prog, &remotes)
+            .await
+            .expect("server startup succeeds");
+
+        assert_eq!(
+            advertised_services(&manager),
+            vec![app],
+            "a service the peer serves must not be advertised at this node"
+        );
+    }
+
+    /// Build the two ASTs `init_server_services` takes: the dependency-ordered
+    /// program-plus-imports AST, and the root program on its own.
+    fn server_asts(interner: &mut Interner) -> (Vec<Stmt>, Vec<Stmt>) {
+        let full = parser::parse_string(
+            "service dep { var x = 1; } service app { def y = dep.x + 1; }",
+            interner,
+        )
+        .expect("fixture parses");
+        let prog = parser::parse_string("service app { def y = dep.x + 1; }", interner)
+            .expect("fixture parses");
+        (full, prog)
+    }
+
+    /// Server mode must instantiate a locally resolved import before the
+    /// service that reads it.
+    ///
+    /// `run_server` had no instantiation step at all: it created only the
+    /// services in `prog`, so `app`'s read of `dep` failed with
+    /// `ServiceNotFound` before the server ever reached its event loop.
+    #[tokio::test]
+    async fn init_server_services_instantiates_locally_resolved_imports() {
+        let mut interner = Interner::new();
+        let (full, prog) = server_asts(&mut interner);
+        let app = interner.insert("app");
+        let dep = interner.insert("dep");
+
+        let mut manager = Manager::new(interner);
+        manager.local = true;
+        init_server_services(&mut manager, full, &prog, &std::collections::HashMap::new())
+            .await
+            .expect("server startup succeeds");
+
+        assert!(
+            manager.services.contains_key(&dep),
+            "the imported service must be instantiated"
+        );
+        assert!(manager.services.contains_key(&app));
+    }
+
+    /// The same, with an unrelated `-i` flag present.
+    ///
+    /// This is the configuration the deleted `target_ast` ternary broke: any
+    /// `-i` flag made the caller pass the root program in place of the unified
+    /// AST, dropping every import. A flag naming some other service must not
+    /// change which services this program brings up.
+    #[tokio::test]
+    async fn init_server_services_keeps_imports_when_an_unrelated_remote_is_configured() {
+        let mut interner = Interner::new();
+        let (full, prog) = server_asts(&mut interner);
+        let dep = interner.insert("dep");
+
+        let mut remotes = std::collections::HashMap::new();
+        remotes.insert("far".to_string(), "/ip4/127.0.0.1/tcp/9000/far".to_string());
+
+        let mut manager = Manager::new(interner);
+        manager.local = true;
+        init_server_services(&mut manager, full, &prog, &remotes)
+            .await
+            .expect("server startup succeeds");
+
+        assert!(
+            manager.services.contains_key(&dep),
+            "an unrelated -i flag must not strip the program's imports"
+        );
+    }
+
+    /// Build a single-node `Manager` from source, with no network layer.
+    async fn manager_from(code: &str) -> Manager {
+        let mut interner = Interner::new();
+        let ast = parser::parse_string(code, &mut interner).expect("valid syntax");
+        let mut node = Node::new();
+        node.interner = interner;
+        node.unified_ast = ast.clone();
+        node.static_checks().expect("static checks must pass");
+        let local_ast = node.unified_ast.clone();
+        node.on_manager_startup(true, None, HashMap::new(), &local_ast)
+            .await
+            .expect("service init must succeed")
+    }
+
+    /// A read of `service.member` by some transaction, as it sits on the queue
+    fn parked_lookup(manager: &Manager, service: Symbol, member: Symbol) -> ParkedRequest {
+        ParkedRequest::Lookup {
+            request_id: 1,
+            reply_to: String::new(),
+            service,
+            member,
+            tid: TxnId::new(manager.node_id),
+        }
+    }
+
+    fn nothing_parked_on(manager: &Manager, key: &WaitKey) -> bool {
+        manager.wait_queue.get(key).is_none_or(|w| w.is_empty())
+    }
+
+    /// A participant action that fails terminally releases its locks, so
+    /// whatever was parked behind them has to be woken.
+    ///
+    /// The failure surfaces as an `EvalError`, with nowhere to return the freed
+    /// keys; without the deferred queue the parked request would wait for the
+    /// life of the process on a lock nobody holds.
+    #[tokio::test]
+    async fn test_terminal_participant_action_wakes_parked_requests() {
+        use meerkat_lib::runtime::ast::{ActionStmt, Expr, Value};
+
+        let mut manager = manager_from("service foo { var x = 0; }").await;
+        let foo = manager.interner.insert("foo");
+        let x = manager.interner.insert("x");
+        let key = WaitKey::Member(manager.service_net_id_for_name(foo), x);
+        let parked = parked_lookup(&manager, foo, x);
+        manager.park_request_key(key.clone(), parked);
+
+        // A composed action that write-locks `foo.x` and then fails terminally.
+        let stmts = vec![
+            ActionStmt::Assign {
+                name: x,
+                expr: Expr::Literal {
+                    val: Value::Int { val: 1 },
+                },
+            },
+            ActionStmt::Assert(
+                Expr::Literal {
+                    val: Value::Bool { val: false },
+                },
+                "always fails".to_string(),
+            ),
+        ];
+        let tid = TxnId::new(manager.node_id);
+        let action = ParkedRequest::Action {
+            request_id: 2,
+            reply_to: String::new(),
+            service: foo,
+            stmts,
+            env: Vec::new(),
+            tid,
+        };
+        run_and_reply_or_park(&mut manager, action).await;
+
+        assert!(
+            nothing_parked_on(&manager, &key),
+            "the failed action released `foo.x`, so the request parked on it must \
+             have been re-dispatched"
+        );
+    }
+
+    /// The same for a read that dies under wait-die, on a different branch of
+    /// the dispatcher: the transaction had already locked `foo.y` before the
+    /// read of `foo.x` that killed it.
+    #[tokio::test]
+    async fn test_terminal_participant_lookup_wakes_parked_requests() {
+        use meerkat_lib::runtime::txn::{Transaction, VarLock};
+
+        let mut manager = manager_from("service foo { var x = 0; var y = 0; }").await;
+        let foo = manager.interner.insert("foo");
+        let x = manager.interner.insert("x");
+        let y = manager.interner.insert("y");
+        let foo_sid = manager.service_net_id_for_name(foo);
+
+        // An older transaction holds `foo.x`, so a younger reader dies on it.
+        let older = TxnId {
+            timestamp: 1,
+            node_id: manager.node_id,
+            iteration: 0,
+        };
+        let vars = &mut manager.services.get_mut(&foo).unwrap().vars;
+        vars.get_mut(&x).unwrap().lock = VarLock::WriteLocked(older);
+
+        // Our transaction already holds `foo.y` from an earlier statement.
+        let mine = TxnId::new(manager.node_id);
+        vars.get_mut(&y).unwrap().lock = VarLock::WriteLocked(mine.clone());
+        let mut txn = Transaction::new(mine.clone());
+        txn.locked.insert((foo_sid.clone(), y));
+        manager.pending_txns.insert(mine.clone(), txn);
+
+        let key = WaitKey::Member(foo_sid, y);
+        let parked = parked_lookup(&manager, foo, y);
+        manager.park_request_key(key.clone(), parked);
+
+        let read = ParkedRequest::Lookup {
+            request_id: 2,
+            reply_to: String::new(),
+            service: foo,
+            member: x,
+            tid: mine,
+        };
+        run_and_reply_or_park(&mut manager, read).await;
+
+        assert!(
+            nothing_parked_on(&manager, &key),
+            "the dead read released `foo.y`, so the request parked on it must have \
+             been re-dispatched"
         );
     }
 }

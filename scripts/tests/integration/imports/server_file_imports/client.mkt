@@ -1,0 +1,9 @@
+import helper
+import hub
+
+service hub_client {}
+
+@test(hub_client) {
+    assert(helper.factor == 5);
+    assert(hub.scaled == 10);
+}

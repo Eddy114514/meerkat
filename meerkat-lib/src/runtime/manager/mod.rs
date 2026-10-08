@@ -1,7 +1,7 @@
 use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
 use super::env::Env;
 use super::graphs::{analysis::compute_dependencies, free_var::cross_service_deps, ServiceGraphs};
-use super::interpreter::{eval, execute, EvalContext, EvalError, ExecuteEffect};
+use super::interpreter::{eval, execute_seq, EvalContext, EvalError, WAIT_DIE_DISPLAY_PREFIX};
 use super::tt::types::ServiceType;
 use crate::net::network_layer::NetworkLayer;
 use crate::net::{
@@ -93,6 +93,20 @@ pub struct Manager {
     /// holder (wait-die wait), keyed by the contended WaitKey. Drained
     /// oldest-first when that lock frees on commit or abort.
     pub wait_queue: HashMap<WaitKey, Vec<ParkedRequest>>,
+    /// Locks released since the server loop last looked, on which a request is
+    /// parked waiting to be woken
+    ///
+    /// Every release goes through `release_locks`, which fills this, so no
+    /// failure path can forget to report its keys. A failure surfaces as an
+    /// `EvalError` through call paths with nowhere to put a key set, and
+    /// `handle_lock_request` under `dispatch_network_events` has no dispatcher
+    /// to hand them to at all. The loop drains it with
+    /// `take_freed_awaiting_wake`
+    ///
+    /// Only keys with a waiter are recorded. That keeps it bounded on a node
+    /// with no loop to drain it: a CLI client parks nothing, so it queues
+    /// nothing, even though it can reach the discard path
+    freed_awaiting_wake: HashSet<WaitKey>,
     /// This node's canonical, dialable address, set once after the network is
     /// listening. Service identities are derived from it, so they are stable for
     /// the life of the process (never empty-then-populated) and match the URL
@@ -115,6 +129,19 @@ pub struct Manager {
     pub local_services: Env<'static, ServiceType>,
 }
 
+/// The names of the services a program declares itself.
+///
+/// These are served locally, so an `-i` flag naming one of them is never
+/// honoured: see `Manager::register_remote_services`.
+pub fn local_service_names(prog: &[Stmt]) -> HashSet<Symbol> {
+    prog.iter()
+        .filter_map(|s| match s {
+            Stmt::Service { name, .. } => Some(*name),
+            _ => None,
+        })
+        .collect()
+}
+
 impl Manager {
     pub fn new(interner: Interner) -> Self {
         Manager {
@@ -125,6 +152,7 @@ impl Manager {
             node_id: Self::random_node_id(),
             pending_txns: HashMap::new(),
             wait_queue: HashMap::new(),
+            freed_awaiting_wake: HashSet::new(),
             local_address: None,
             local: false,
             interner,
@@ -138,6 +166,12 @@ impl Manager {
     /// Park a request on the wait queue for the contended `WaitKey`
     pub fn park_request_key(&mut self, key: WaitKey, parked: ParkedRequest) {
         self.wait_queue.entry(key).or_default().push(parked);
+    }
+
+    /// Take the locks released since the last call, to wake whatever is
+    /// parked on them. Empty on a quiet loop iteration
+    pub fn take_freed_awaiting_wake(&mut self) -> HashSet<WaitKey> {
+        std::mem::take(&mut self.freed_awaiting_wake)
     }
 
     /// Park a request on the wait queue for the contended `(service, var)`
@@ -243,6 +277,99 @@ impl Manager {
                 // changes mid-run
                 ServiceNetId::new(name_str)
             }
+        }
+    }
+
+    /// Register the parsed `-i <url>` mappings, then instantiate every locally
+    /// resolved import. Steps 1-3 of CLI startup; the caller then creates the
+    /// services the program declares itself, in program order.
+    ///
+    /// Shared by every entry point that starts a node from a parsed program, so
+    /// the ordering below is established once rather than re-derived per
+    /// caller. `unified_ast` must already be set.
+    ///
+    /// `remote_url_map` maps a service slug to the address serving it. The CLI
+    /// builds it from repeated `-i <url>` flags, taking the slug from each
+    /// URL's final path segment (`meerkat/src/main.rs`).
+    ///
+    /// Errors:
+    ///   `EvalError`: If instantiating an imported service fails
+    pub async fn register_and_instantiate_imports(
+        &mut self,
+        prog: &[Stmt],
+        remote_url_map: &HashMap<String, String>,
+    ) -> Result<(), EvalError> {
+        // Services declared by this program itself. An import must not
+        // instantiate these: the caller creates them from `prog`.
+        let local = local_service_names(prog);
+
+        // Register every configured remote service up front, before any import
+        // is processed. Doing it lazily as each root `Stmt::Import` is reached
+        // makes instantiation order-dependent: an earlier local import walks
+        // the whole unified AST, and a remote service it finds there would be
+        // built locally as a phantom copy. A remote service reached only
+        // transitively has no root `Stmt::Import` at all, so it would never be
+        // registered and every read and action would silently target that local
+        // copy instead of the owning node.
+        self.register_remote_services(remote_url_map, &local);
+
+        // Instantiate every locally resolved import before any of this
+        // program's own services, in `unified_ast` order (which is dependency
+        // order). The grammar allows `import` to appear after the service that
+        // uses it, and static checks accept that because the unified AST is
+        // reordered, so creating imports only when their `Stmt::Import` is
+        // reached would build `app` before the `dep` it reads and fail with
+        // `ServiceNotFound`.
+        let imported: Vec<(Symbol, Vec<Decl>)> = self
+            .unified_ast
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Service { name, decls } => Some((*name, decls.clone())),
+                _ => None,
+            })
+            .filter(|(name, _)| !local.contains(name) && !self.remote_services.contains_key(name))
+            .collect();
+        for (name, decls) in imported {
+            if self.services.contains_key(&name) {
+                continue;
+            }
+            self.create_service(name, decls).await?;
+            println!("Imported service '{}'", self.interner.get(name));
+        }
+        Ok(())
+    }
+
+    /// Record each entry of `remote_url_map` -- service slug to the address
+    /// serving it -- in `remote_services`.
+    ///
+    /// The CLI builds that map from repeated `-i <url>` flags, taking the slug
+    /// from each URL's final path segment (`meerkat/src/main.rs`); a slug is
+    /// therefore whatever the URL happens to end with, not something the user
+    /// states outright.
+    ///
+    /// A service this program declares itself is never registered as remote,
+    /// whatever `-i` says. `lookup` consults `remote_services` before anything
+    /// local, so a slug collision would otherwise route a locally declared
+    /// service's reads and writes to a peer and leave the local copy
+    /// unreachable. Since the slug is implicit, such a collision is easy to
+    /// hit by accident, so it is reported rather than quietly dropped.
+    pub fn register_remote_services(
+        &mut self,
+        remote_url_map: &HashMap<String, String>,
+        local: &HashSet<Symbol>,
+    ) {
+        for (svc, url) in remote_url_map {
+            let sym = self.interner.insert(svc);
+            if local.contains(&sym) {
+                println!(
+                    "Warning: ignoring '-i {}': '{}' is declared by this program \
+                     and is served locally",
+                    url, svc
+                );
+                continue;
+            }
+            self.remote_services.insert(sym, Address::new(url.as_str()));
+            println!("Remote service '{}' registered at {}", svc, url);
         }
     }
 
@@ -381,20 +508,11 @@ impl Manager {
 
         // #87: commit on success, abort and roll back on failure (pattern from
         // execute_action_with_txn).
-        // #98: a participant commit can fail after prepare (timeout, etc.).
-        // Apply local writes, then attempt every participant commit -- do not
-        // stop at the first failure, or later participants are left prepared --
-        // and remember the first error to surface once init otherwise succeeded.
+        // #98: a participant commit can fail after prepare (timeout, etc.);
+        // remember the first error to surface once init otherwise succeeded.
         let mut commit_error = None;
         if init_error.is_none() {
-            self.apply_committed_writes(&txn).await;
-            for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                if let Err(e) = self.send_commit(addr, &txn.id).await {
-                    if commit_error.is_none() {
-                        commit_error = Some(e);
-                    }
-                }
-            }
+            commit_error = self.commit_txn(&txn).await;
 
             // #24: now that init succeeded, register listener edges so
             // a change to a member notifies the defs that depend on it
@@ -405,11 +523,11 @@ impl Manager {
                 self.update_service_graphs(svc_name, graphs).await;
             }
 
-            // #98: a participant failed to commit after prepare. Roll
-            // the local service back rather than leaving it
-            // half-committed but live: abort participants and remove the
-            // service, mirroring the init-failure path. The captured
-            // error is returned below
+            // #98: a participant failed to commit. Participants here only hold
+            // read locks (initialization never runs actions), so nothing is left
+            // half-applied: remove the service, mirroring the init-failure path,
+            // and abort participants to release any locks still held. The
+            // captured error is returned below
             if commit_error.is_some() {
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     self.send_abort(addr, &txn.id).await;
@@ -437,8 +555,7 @@ impl Manager {
         }
 
         // Release all locks held locally (always, even on error)
-        let freed = self.all_locked_keys(&txn);
-        self.release_locks(&freed, &txn.id);
+        self.release_all_locks(&txn);
 
         let result = match init_error {
             Some(e) => Err(e),
@@ -1181,6 +1298,41 @@ impl Manager {
         }
     }
 
+    /// Rebuild a structured error from a failure a remote node reported.
+    ///
+    /// Errors cross the wire as their `Display` text, so a wait-die abort comes
+    /// back as an ordinary string. Flattening it to `LocalDispatchFailed` turns
+    /// ordinary lock contention into a terminal failure, because
+    /// `execute_action_with_txn` retries `WaitDieAbort` and nothing else. Every
+    /// reply that can carry a lock outcome goes through here so lock requests,
+    /// reads and composed actions all behave the same way.
+    ///
+    /// Matched on the prefix `EvalError`'s `Display` writes, not on the phrase
+    /// appearing anywhere. Error text quotes user input -- an assertion carries
+    /// its own source text, for one -- so a message that merely mentions
+    /// wait-die would otherwise be retried through the whole budget and then
+    /// reported as a lock conflict that never happened, hiding the real
+    /// failure.
+    ///
+    /// The prefix is stripped rather than kept, because `WaitDieAbort` writes
+    /// it back when it displays itself. Keeping it would nest one copy per node
+    /// the failure passed through -- a retry exhausted on the originator, or a
+    /// node in the middle forwarding it on -- and the message a `@test` reports
+    /// would read `Wait-die abort: Wait-die abort: ...`.
+    ///
+    /// Args:
+    ///     `err` (`String`): The `Display` text a remote node reported
+    ///
+    /// Returns:
+    ///     `EvalError`: `WaitDieAbort` for a lock conflict, otherwise
+    ///     `LocalDispatchFailed`
+    fn remote_error(err: String) -> EvalError {
+        match err.strip_prefix(WAIT_DIE_DISPLAY_PREFIX) {
+            Some(reason) => EvalError::WaitDieAbort(reason.to_string()),
+            None => EvalError::LocalDispatchFailed(err),
+        }
+    }
+
     /// shared by remote_lookup and remote_action.
     pub async fn send_and_await_reply(
         &mut self,
@@ -1324,9 +1476,7 @@ impl Manager {
                 self.interner.get(service)
             ))
         })?;
-        let service_str = self.interner.get(service);
-        let addr_str = full_url.0.trim_end_matches(&format!("/{}", service_str));
-        Ok(Address::new(addr_str))
+        Ok(full_url.node_address(self.interner.get(service)))
     }
 
     /// Get our local address with peer ID for use as reply_to
@@ -1512,7 +1662,7 @@ impl Manager {
                     .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
                 Ok(val)
             }
-            MeerkatMessage::LookupError { error, .. } => Err(EvalError::LocalDispatchFailed(error)),
+            MeerkatMessage::LookupError { error, .. } => Err(Self::remote_error(error)),
             MeerkatMessage::Ping { .. }
             | MeerkatMessage::Pong { .. }
             | MeerkatMessage::Announce { .. }
@@ -1649,7 +1799,7 @@ impl Manager {
                     // Participant already registered above; nothing more to do.
                     Ok(())
                 } else {
-                    Err(EvalError::LocalDispatchFailed(
+                    Err(Self::remote_error(
                         error.unwrap_or_else(|| "Remote action failed".to_string()),
                     ))
                 }
@@ -1936,13 +2086,14 @@ impl Manager {
         keys
     }
 
-    /// Release all locks held by `txn_id` on the given variables (and service locks)
     /// Release all locks (both member and service level) held by a transaction
     pub fn release_all_locks(&mut self, txn: &Transaction) {
         let keys = self.all_locked_keys(txn);
         self.release_locks(&keys, &txn.id);
     }
 
+    /// Release `locked`, recording in `freed_awaiting_wake` the keys a request
+    /// is parked on
     fn release_locks(&mut self, locked: &HashSet<WaitKey>, txn_id: &TxnId) {
         for key in locked {
             match key {
@@ -1962,6 +2113,12 @@ impl Manager {
                 }
             }
         }
+        let waited_on: Vec<WaitKey> = locked
+            .iter()
+            .filter(|k| self.wait_queue.get(k).is_some_and(|w| !w.is_empty()))
+            .cloned()
+            .collect();
+        self.freed_awaiting_wake.extend(waited_on);
     }
 
     /// Execute action statements as a transaction with lazy lock
@@ -1994,24 +2151,15 @@ impl Manager {
             let mut txn = Transaction::new(txn_id.clone());
 
             let mut env: Vec<(Symbol, Value)> = initial_env.to_vec();
-            let mut exec_error: Option<EvalError> = None;
-            for stmt in stmts {
-                match execute(stmt, &env, self, service_name, Some(&mut txn)).await {
-                    Ok(ExecuteEffect::Binding(name, val)) => env.push((name, val)),
-                    Ok(_) => {}
-                    Err(e) => {
-                        exec_error = Some(e);
-                        break;
-                    }
-                }
-            }
+            let exec_error = execute_seq(stmts, &mut env, self, service_name, Some(&mut txn))
+                .await
+                .err();
 
             if matches!(exec_error, Some(EvalError::WaitDieAbort(_))) {
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     self.send_abort(addr, &txn.id).await;
                 }
-                let freed = self.all_locked_keys(&txn);
-                self.release_locks(&freed, &txn.id);
+                self.release_all_locks(&txn);
                 if txn_id.iteration < MAX_WAIT_DIE_RETRIES {
                     txn_id = txn_id.retry();
                     continue;
@@ -2019,53 +2167,97 @@ impl Manager {
                 return Err(exec_error.unwrap());
             }
 
-            if exec_error.is_none() {
-                self.apply_committed_writes(&txn).await;
-                for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                    let _ = self.send_commit(addr, &txn.id).await;
+            // A refused commit is reported, not swallowed: on `Ok` the CLI
+            // prints `@test(...) passed` for a transaction only part of which
+            // committed. There is no rollback to offer -- this node's writes
+            // are already stored (#191)
+            let error = match exec_error {
+                None => self.commit_txn(&txn).await,
+                Some(e) => {
+                    for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+                        self.send_abort(addr, &txn.id).await;
+                    }
+                    Some(e)
                 }
-            } else {
-                for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                    self.send_abort(addr, &txn.id).await;
-                }
-            }
-
-            let freed = self.all_locked_keys(&txn);
-            self.release_locks(&freed, &txn.id);
-
-            return match exec_error {
-                Some(e) => Err(e),
-                None => Ok(()),
             };
+
+            self.release_all_locks(&txn);
+
+            return error.map_or(Ok(()), Err);
         }
     }
 
-    /// Apply a transaction's buffered writes to the owning services, record
-    /// the writing transaction, and propagate to dependent definitions
+    /// Commit a transaction on this node and on every participant, returning
+    /// the first participant's failure to commit (see `commit_participants`)
     ///
-    /// Shared by local commit and by a participant committing on a remote
-    /// `Commit` message
+    /// Stores this node's writes, commits the participants, and only then
+    /// recomputes what derives from the writes. Propagating first would
+    /// recompute a def over a remote member while that member's node is still
+    /// holding its write buffered, storing a value that was never true
     ///
-    /// Infallible: once we are applying writes the transaction is
-    /// committed, so there is no going back. Propagation is best-effort
-    async fn apply_committed_writes(&mut self, txn: &Transaction) {
-        let writes: Vec<((ServiceNetId, Symbol), Value)> = txn
-            .written
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let txn_id = txn.id.clone();
-        for ((sid, var), value) in &writes {
+    /// Propagation is best-effort and runs even when a participant failed:
+    /// the writes are stored, so the transaction has committed here and there
+    /// is no way back
+    async fn commit_txn(&mut self, txn: &Transaction) -> Option<EvalError> {
+        for ((sid, var), value) in &txn.written {
             if let Some(service) = self.service_by_net_id_mut(sid) {
                 if let Some(var_state) = service.vars.get_mut(var) {
                     var_state.value = value.clone();
-                    var_state.latest_write_txn = Some(txn_id.clone());
+                    var_state.latest_write_txn = Some(txn.id.clone());
                 }
             }
         }
-        for ((sid, var), _) in &writes {
+        let error = self.commit_participants(txn).await;
+        self.forget_participant_deps(txn);
+        for (sid, var) in txn.written.keys() {
             if let Some(name) = self.service_name_for_net_id(sid) {
                 self.propagate(name, *var).await;
+            }
+        }
+        error
+    }
+
+    /// Send `Commit` to every participant of `txn`, returning the first
+    /// failure in the set's iteration order, which is arbitrary
+    ///
+    /// Does not stop at a failure, or the later participants are left
+    /// prepared and holding locks
+    pub(crate) async fn commit_participants(&mut self, txn: &Transaction) -> Option<EvalError> {
+        let mut first_error = None;
+        for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+            if let Err(e) = self.send_commit(addr.clone(), &txn.id).await {
+                log::warn!("participant {} failed to commit: {}", addr.0, e);
+                first_error.get_or_insert(e);
+            }
+        }
+        first_error
+    }
+
+    /// Drop the cached values of remote members owned by a transaction's
+    /// participants
+    ///
+    /// `dep_cache` holds whatever the last `Update` delivered, and a
+    /// participant's `Update` for this commit can arrive after its
+    /// `CommitResponse`. Recomputing from the cache would then pair this node's
+    /// new writes with the participant's old values. Without the entries, the
+    /// recompute looks the members up from the participant, which has already
+    /// committed. The next `Update` refills them
+    fn forget_participant_deps(&mut self, txn: &Transaction) {
+        if txn.participants.is_empty() {
+            return;
+        }
+        let owned_by_participants: HashSet<Symbol> = self
+            .remote_services
+            .keys()
+            .copied()
+            .filter(|svc| {
+                self.remote_addr(*svc)
+                    .is_ok_and(|addr| txn.participants.contains(&addr))
+            })
+            .collect();
+        for service in self.services.values_mut() {
+            for cache in service.dep_cache.values_mut() {
+                cache.retain(|(owner, _), _| !owned_by_participants.contains(owner));
             }
         }
     }
@@ -2087,17 +2279,9 @@ impl Manager {
             .remove(&tid)
             .unwrap_or_else(|| Transaction::new(tid.clone()));
         let mut env: Vec<(Symbol, Value)> = initial_env.to_vec();
-        let mut exec_error: Option<EvalError> = None;
-        for stmt in stmts {
-            match execute(stmt, &env, self, service_name, Some(&mut txn)).await {
-                Ok(ExecuteEffect::Binding(name, val)) => env.push((name, val)),
-                Ok(_) => {}
-                Err(e) => {
-                    exec_error = Some(e);
-                    break;
-                }
-            }
-        }
+        let exec_error = execute_seq(stmts, &mut env, self, service_name, Some(&mut txn))
+            .await
+            .err();
         if let Some(e) = exec_error {
             if matches!(e, EvalError::WaitOn(_)) {
                 self.pending_txns.insert(tid, txn);
@@ -2111,51 +2295,48 @@ impl Manager {
     }
 
     /// Participant side: apply and release a held transaction on `Commit`
-    pub async fn commit_participant(&mut self, tid: &TxnId) -> Result<HashSet<WaitKey>, EvalError> {
-        if let Some(txn) = self.pending_txns.remove(tid) {
-            let freed = self.all_locked_keys(&txn);
-            self.apply_committed_writes(&txn).await;
-            self.release_locks(&freed, &txn.id);
-            let mut forward_err = None;
-            for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                if let Err(e) = self.send_commit(addr, tid).await {
-                    forward_err = Some(e);
-                }
-            }
-            match forward_err {
-                Some(e) => Err(e),
-                None => Ok(freed),
-            }
-        } else {
-            Ok(HashSet::new())
-        }
+    ///
+    /// An error is a failure forwarding the commit to a node below. The local
+    /// commit is done either way, and the freed keys reach the server loop
+    /// through `freed_awaiting_wake`, so they are woken on that path too
+    pub async fn commit_participant(&mut self, tid: &TxnId) -> Result<(), EvalError> {
+        let Some(txn) = self.pending_txns.remove(tid) else {
+            return Ok(());
+        };
+        let forward_error = self.commit_txn(&txn).await;
+        // Held until here, like the originator holds its own. Today the
+        // event loop is blocked for the whole of this call, so an earlier
+        // release would be harmless. That stops being true under #28's
+        // background message loop, which `send_and_await_reply` is also
+        // waiting on: once other work can interleave here, releasing
+        // before the nodes below have committed exposes half of a
+        // distributed transaction to whoever takes the lock next
+        self.release_all_locks(&txn);
+        forward_error.map_or(Ok(()), Err)
     }
 
     /// Centralized cleanup for a participant transaction that encountered a terminal failure
     ///
     /// Releases local locks and aborts all sub-participants before dropping the transaction
     ///
+    /// The freed keys reach the server loop through `freed_awaiting_wake`
+    ///
     /// Args:
     ///     txn (Transaction): The transaction context
-    ///
-    /// Returns:
-    ///     HashSet<WaitKey>: The set of freed wait keys
-    async fn discard_failed_participant_txn(&mut self, txn: Transaction) -> HashSet<WaitKey> {
-        let freed = self.all_locked_keys(&txn);
-        self.release_locks(&freed, &txn.id);
+    async fn discard_failed_participant_txn(&mut self, txn: Transaction) {
+        self.release_all_locks(&txn);
         for addr in txn.participants {
             self.send_abort(addr, &txn.id).await;
         }
-        freed
     }
 
     /// Participant side: discard and release a held transaction on `Abort`, and
     /// forward the abort down the chain to any sub-participants
-    pub async fn abort_participant(&mut self, tid: &TxnId) -> HashSet<WaitKey> {
+    ///
+    /// The freed keys reach the server loop through `freed_awaiting_wake`
+    pub async fn abort_participant(&mut self, tid: &TxnId) {
         if let Some(txn) = self.pending_txns.remove(tid) {
-            self.discard_failed_participant_txn(txn).await
-        } else {
-            HashSet::new()
+            self.discard_failed_participant_txn(txn).await;
         }
     }
 
@@ -2262,8 +2443,7 @@ impl Manager {
             // ensuring the transaction yields completely and retries
             // from scratch when unparked
             Err(EvalError::WaitOn(key)) => {
-                let freed = self.all_locked_keys(&txn);
-                self.release_locks(&freed, &txn.id);
+                self.release_all_locks(&txn);
                 txn.locked.clear();
                 txn.service_locked.clear();
 
@@ -2457,10 +2637,7 @@ impl Manager {
                     if !success {
                         let err_str = error
                             .unwrap_or_else(|| "Lock request rejected by remote node".to_string());
-                        if err_str.contains("Wait-die abort") {
-                            return Err(EvalError::WaitDieAbort(err_str));
-                        }
-                        return Err(EvalError::LocalDispatchFailed(err_str));
+                        return Err(Self::remote_error(err_str));
                     }
                 }
                 _ => {
@@ -2578,6 +2755,26 @@ impl Manager {
         self.execute_action_with_txn(service_name, stmts, initial_env)
             .await
     }
+
+    /// Execute a `@test` block's statements outside any transaction
+    ///
+    /// The block as a whole is not a transaction. Each statement runs against
+    /// committed state, so reads see the latest values and assignments apply
+    /// and propagate immediately rather than being buffered until the end of
+    /// the block. Only `do` statements are transactional, and each one opens a
+    /// fresh transaction of its own (see `executor::execute`).
+    ///
+    /// The first statement to fail ends the block. Because there is no
+    /// enclosing transaction, the effects of the statements that already ran
+    /// -- including any `do` that already committed -- stay in place.
+    pub async fn execute_test_block(
+        &mut self,
+        service_name: Symbol,
+        stmts: &[ActionStmt],
+    ) -> Result<(), EvalError> {
+        let mut env: Vec<(Symbol, Value)> = Vec::new();
+        execute_seq(stmts, &mut env, self, service_name, None).await
+    }
 }
 
 impl Default for Manager {
@@ -2590,6 +2787,7 @@ impl Default for Manager {
 mod tests {
     use super::*;
     use crate::ast::{Decl, Expr, Value};
+    use crate::runtime::interpreter::execute;
 
     // #24: cross_service_deps pulls out exactly the (service, member) symbols
     // referenced via MemberAccess, and nothing for a purely local expression.
@@ -2982,6 +3180,158 @@ mod tests {
         );
     }
 
+    /// Build `service <name> { var x = <val>; }`.
+    fn service_stmt(interner: &mut Interner, name: &str, val: i32) -> Stmt {
+        Stmt::Service {
+            name: interner.insert(name),
+            decls: vec![Decl::VarDecl {
+                name: interner.insert("x"),
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val },
+                },
+            }],
+        }
+    }
+
+    /// `local_service_names` reports declarations and nothing else.
+    #[test]
+    fn local_service_names_covers_declarations_only() {
+        let mut interner = Interner::new();
+        let app = interner.insert("app");
+        let dep = interner.insert("dep");
+        let prog = vec![
+            Stmt::Import {
+                path: "dep.mkt".to_string(),
+                service_name: dep,
+            },
+            service_stmt(&mut interner, "app", 0),
+        ];
+
+        let names = local_service_names(&prog);
+
+        assert!(names.contains(&app));
+        assert!(
+            !names.contains(&dep),
+            "an `import` is a reference, not a declaration: counting it would \
+             suppress the `-i` flag that resolves it"
+        );
+    }
+
+    /// An `-i` flag naming a service this program declares must be refused.
+    ///
+    /// `lookup` consults `remote_services` before anything local, so
+    /// registering it would route the locally declared service's reads and
+    /// writes to a peer and leave the local copy permanently unreachable.
+    #[test]
+    fn register_remote_services_skips_locally_declared_services() {
+        let mut manager = Manager::default();
+        let prog = vec![service_stmt(&mut manager.interner, "s2", 0)];
+        let local = local_service_names(&prog);
+        let mut urls = HashMap::new();
+        urls.insert("s2".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+        urls.insert("s9".to_string(), "/ip4/127.0.0.1/tcp/9001".to_string());
+
+        manager.register_remote_services(&urls, &local);
+
+        let s2 = manager.interner.insert("s2");
+        let s9 = manager.interner.insert("s9");
+        assert!(
+            !manager.remote_services.contains_key(&s2),
+            "a locally declared service must never be registered as remote"
+        );
+        assert!(
+            manager.remote_services.contains_key(&s9),
+            "an unrelated -i flag must still be honoured"
+        );
+    }
+
+    /// Imports are instantiated from `unified_ast`, before the program's own
+    /// services and in dependency order.
+    #[tokio::test]
+    async fn register_and_instantiate_imports_builds_imported_services() {
+        let mut manager = Manager::default();
+        let dep = service_stmt(&mut manager.interner, "dep", 7);
+        let app = service_stmt(&mut manager.interner, "app", 1);
+        let prog = vec![app.clone()];
+        manager.unified_ast = vec![dep, app];
+
+        manager
+            .register_and_instantiate_imports(&prog, &HashMap::new())
+            .await
+            .expect("imports instantiate");
+
+        let dep_sym = manager.interner.insert("dep");
+        let app_sym = manager.interner.insert("app");
+        assert!(
+            manager.services.contains_key(&dep_sym),
+            "a locally resolved import must be instantiated"
+        );
+        assert!(
+            !manager.services.contains_key(&app_sym),
+            "the program's own services are created by the caller, in program order"
+        );
+    }
+
+    /// An unrelated `-i` flag must not stop local imports being instantiated.
+    ///
+    /// `run_server` used to be handed `prog` instead of the unified AST
+    /// whenever any `-i` flag was present, which silently dropped every
+    /// locally resolved import in exactly the configuration that mixes local
+    /// and remote services.
+    #[tokio::test]
+    async fn register_and_instantiate_imports_survives_an_unrelated_remote_flag() {
+        let mut manager = Manager::default();
+        let dep = service_stmt(&mut manager.interner, "dep", 7);
+        let app = service_stmt(&mut manager.interner, "app", 1);
+        let prog = vec![app.clone()];
+        manager.unified_ast = vec![dep, app];
+        let mut urls = HashMap::new();
+        urls.insert("far".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+
+        manager
+            .register_and_instantiate_imports(&prog, &urls)
+            .await
+            .expect("imports instantiate");
+
+        let dep_sym = manager.interner.insert("dep");
+        assert!(
+            manager.services.contains_key(&dep_sym),
+            "an unrelated -i flag must not suppress local imports"
+        );
+    }
+
+    /// A service resolved remotely must not also be built locally.
+    ///
+    /// It appears in `unified_ast` because its source was fetched for type
+    /// checking, but the owning node serves it; a local copy would shadow the
+    /// peer, since `lookup` prefers `remote_services`.
+    #[tokio::test]
+    async fn register_and_instantiate_imports_skips_remote_services() {
+        let mut manager = Manager::default();
+        let dep = service_stmt(&mut manager.interner, "dep", 7);
+        let app = service_stmt(&mut manager.interner, "app", 1);
+        let prog = vec![app.clone()];
+        manager.unified_ast = vec![dep, app];
+        let mut urls = HashMap::new();
+        urls.insert("dep".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+
+        manager
+            .register_and_instantiate_imports(&prog, &urls)
+            .await
+            .expect("imports instantiate");
+
+        let dep_sym = manager.interner.insert("dep");
+        assert!(
+            manager.remote_services.contains_key(&dep_sym),
+            "the -i flag must be honoured"
+        );
+        assert!(
+            !manager.services.contains_key(&dep_sym),
+            "a remotely served service must not be built as a local phantom copy"
+        );
+    }
+
     #[tokio::test]
     async fn test_lookup_missing_var_returns_error() {
         let mut tc = TestContext::new();
@@ -3164,6 +3514,43 @@ mod tests {
         let result = tc.manager.lookup(tc.x, tc.foo, None).await.unwrap();
         // and the lock was released
         assert_eq!(result, Value::Int { val: 1 });
+        assert_x_unlocked(&tc);
+    }
+
+    #[tokio::test]
+    async fn test_test_block_commits_each_do_separately() {
+        // A `@test` block is not itself a transaction: each `do` opens and
+        // commits a transaction of its own, so a failure later in the block
+        // cannot roll back a `do` that already committed. Contrast with
+        // `test_txn_failed_transaction_leaves_no_partial_writes`, where the
+        // whole statement list is one transaction
+        let mut tc = manager_with_x().await;
+        let bump = Expr::Action(vec![ActionStmt::Assign {
+            name: tc.x,
+            expr: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::Variable { name: tc.x }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Int { val: 1 },
+                }),
+            },
+        }]);
+        let stmts = vec![
+            ActionStmt::Do(bump.clone()),
+            ActionStmt::Do(bump),
+            ActionStmt::Assert(
+                Expr::Literal {
+                    val: Value::Bool { val: false },
+                },
+                "forced failure".to_string(),
+            ),
+        ];
+
+        let result = tc.manager.execute_test_block(tc.foo, &stmts).await;
+
+        assert!(matches!(result, Err(EvalError::AssertionError(_))));
+        // Each `do` committed as it ran, and the failing assert left them be
+        assert_eq!(x_state(&tc).value, Value::Int { val: 2 });
         assert_x_unlocked(&tc);
     }
 
@@ -3505,6 +3892,112 @@ mod tests {
         ));
     }
 
+    /// A wait-die abort raised on a participant must still be a wait-die abort
+    /// once it has crossed the wire.
+    ///
+    /// Errors travel as `Display` text, and `execute_action_with_txn` retries
+    /// `WaitDieAbort` and nothing else, so flattening the reply to
+    /// `LocalDispatchFailed` would turn ordinary lock contention into a
+    /// terminal failure. This walks the round trip: the participant's error,
+    /// serialized the way the reply does it, then rebuilt on the originator.
+    #[tokio::test]
+    async fn test_remote_wait_die_survives_the_round_trip() {
+        let mut tc = manager_with_x().await;
+
+        // An older transaction holds `x` exclusively.
+        let older = TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        tc.manager
+            .services
+            .get_mut(&tc.foo)
+            .unwrap()
+            .vars
+            .get_mut(&tc.x)
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(older);
+
+        // A younger transaction reads it as a participant would: wait-die says die.
+        let younger = TxnId::new(tc.manager.node_id);
+        let err = tc
+            .manager
+            .remote_read_participant(tc.foo, tc.x, younger)
+            .await
+            .expect_err("a younger transaction must die against an older holder");
+        assert!(matches!(err, EvalError::WaitDieAbort(_)));
+
+        // This is exactly what the reply carries and what the originator gets.
+        let on_the_wire = err.to_string();
+        let rebuilt = Manager::remote_error(on_the_wire);
+        assert!(
+            matches!(rebuilt, EvalError::WaitDieAbort(_)),
+            "the originator must see a retryable wait-die abort, not a terminal dispatch failure"
+        );
+    }
+
+    /// A wait-die abort must read the same after any number of hops.
+    ///
+    /// `Display` writes `WAIT_DIE_DISPLAY_PREFIX`, and the reply carries that
+    /// text, so rebuilding the variant from the whole reply stores the prefix
+    /// inside the payload and prints it twice. Every further hop -- a retry
+    /// exhausted on the originator, or a node in the middle forwarding the
+    /// failure on -- adds another copy, so the message a `@test` reports grows
+    /// a prefix per node it passed through.
+    #[tokio::test]
+    async fn test_remote_wait_die_prefix_is_not_repeated_per_hop() {
+        let original = EvalError::WaitDieAbort("transaction died contending for 'x'".to_string());
+        let expected = original.to_string();
+
+        let mut text = expected.clone();
+        for hop in 1..=3 {
+            text = Manager::remote_error(text).to_string();
+            assert_eq!(
+                text, expected,
+                "after {hop} hop(s) the message must still read as one wait-die abort"
+            );
+        }
+    }
+
+    /// A remote failure that merely mentions wait-die must stay a failure.
+    ///
+    /// The reply carries `Display` text, so the prefix `WaitDieAbort` writes is
+    /// the only thing that marks a lock conflict. Error messages quote user
+    /// input -- an assertion carries its own source text, so a program that
+    /// compares against the phrase produces one -- and accepting the phrase
+    /// anywhere would send `execute_action_with_txn` through the whole wait-die
+    /// retry budget and then report a lock conflict that never happened,
+    /// instead of the assertion that actually failed.
+    #[tokio::test]
+    async fn test_remote_error_matches_the_wait_die_prefix_not_the_phrase() {
+        let mut tc = TestContext::new();
+
+        // `assert` carries the source text of its condition, so this is the
+        // message a real program produces, not a hand-built string.
+        let stmt = ActionStmt::Assert(
+            Expr::Literal {
+                val: Value::Bool { val: false },
+            },
+            "note == \"Wait-die abort: seen in the log\"".to_string(),
+        );
+        let on_the_wire = match execute(&stmt, &[], &mut tc.manager, tc.foo, None).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a false assertion must fail"),
+        };
+        assert!(
+            on_the_wire.contains("Wait-die abort"),
+            "this test is only meaningful if the message mentions the phrase, got: {on_the_wire}"
+        );
+        assert!(
+            matches!(
+                Manager::remote_error(on_the_wire),
+                EvalError::LocalDispatchFailed(_)
+            ),
+            "a failure that only quotes the phrase must stay terminal, not become retryable"
+        );
+    }
+
     #[tokio::test]
     async fn test_wait_die_participant_preserves_partial_txn() {
         // Wait-die: a participant action that conflicts mid-execution
@@ -3725,8 +4218,10 @@ mod tests {
             },
         );
 
-        // The younger holder aborts, freeing `x`
-        let freed = tc.manager.abort_participant(&younger).await;
+        // The younger holder aborts, freeing `x`. The released keys reach the
+        // caller through `take_freed_awaiting_wake`
+        tc.manager.abort_participant(&younger).await;
+        let freed = tc.manager.take_freed_awaiting_wake();
         assert!(matches!(
             tc.manager
                 .services
@@ -4117,5 +4612,230 @@ mod tests {
         let res = manager.handle_lock_request(txn_id, services).await;
         assert!(res.is_err());
         assert!(matches!(res, Err(EvalError::RuntimeError(_))));
+    }
+
+    /// `x = x + 1`
+    fn incr_x(tc: &TestContext) -> ActionStmt {
+        ActionStmt::Assign {
+            name: tc.x,
+            expr: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::Variable { name: tc.x }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Int { val: 1 },
+                }),
+            },
+        }
+    }
+
+    /// A read of `foo.member` by some transaction, as it sits on the wait queue
+    fn parked_lookup(tc: &TestContext, member: Symbol) -> ParkedRequest {
+        ParkedRequest::Lookup {
+            request_id: 1,
+            reply_to: String::new(),
+            service: tc.foo,
+            member,
+            tid: TxnId::new(tc.manager.node_id),
+        }
+    }
+
+    /// The freed-key queue holds only keys something is actually parked on.
+    ///
+    /// A key nothing waits on has nothing to wake, and on a node that never
+    /// parks anything it would be an entry that is never drained. A CLI client
+    /// is exactly that node: it serves a `LockRequest` inline from
+    /// `dispatch_network_events` while awaiting some other reply, so it can
+    /// reach the discard path, but it has no loop to drain the queue.
+    #[tokio::test]
+    async fn test_freed_keys_are_queued_only_when_something_is_parked_on_them() {
+        let mut tc = manager_with_x().await;
+        let key = WaitKey::Member(tc.manager.service_net_id_for_name(tc.foo), tc.x);
+
+        // Locks `x`, then fails terminally, so `x` is released.
+        let stmts = vec![
+            incr_x(&tc),
+            ActionStmt::Assert(
+                Expr::Literal {
+                    val: Value::Bool { val: false },
+                },
+                "always fails".to_string(),
+            ),
+        ];
+        let tid = TxnId::new(tc.manager.node_id);
+        tc.manager
+            .execute_action_participant(tc.foo, &stmts, &[], tid)
+            .await
+            .expect_err("the assertion fails the action");
+        assert!(
+            tc.manager.take_freed_awaiting_wake().is_empty(),
+            "nothing is parked on `x`, so its release must not be queued"
+        );
+
+        // With a waiter, the same failure queues exactly that key.
+        let parked = parked_lookup(&tc, tc.x);
+        tc.manager.park_request_key(key.clone(), parked);
+        let tid = TxnId::new(tc.manager.node_id);
+        tc.manager
+            .execute_action_participant(tc.foo, &stmts, &[], tid)
+            .await
+            .expect_err("the assertion fails the action");
+        assert_eq!(
+            tc.manager.take_freed_awaiting_wake(),
+            HashSet::from([key]),
+            "a request is parked on `x`, so its release must be queued for waking"
+        );
+    }
+
+    /// A commit reports its freed keys through the deferred queue, like every
+    /// other release, and each key is delivered once.
+    ///
+    /// Two deliveries of one key would wake two waiters: the second wake fires
+    /// while the first waiter is holding the lock it was just handed, and
+    /// wait-die kills the second rather than leaving it parked.
+    #[tokio::test]
+    async fn test_commit_reports_its_freed_keys_once() {
+        let mut tc = manager_with_x().await;
+        let key = WaitKey::Member(tc.manager.service_net_id_for_name(tc.foo), tc.x);
+
+        // A prepared participant transaction holding the write lock on `x`.
+        let holder = TxnId::new(tc.manager.node_id);
+        tc.manager
+            .execute_action_participant(tc.foo, &[incr_x(&tc)], &[], holder.clone())
+            .await
+            .unwrap();
+
+        // Two waiters parked behind it, oldest first.
+        let parked_action = |timestamp| ParkedRequest::Action {
+            request_id: 1,
+            reply_to: String::new(),
+            service: tc.foo,
+            stmts: vec![incr_x(&tc)],
+            env: vec![],
+            tid: TxnId {
+                timestamp,
+                node_id: tc.manager.node_id,
+                iteration: 0,
+            },
+        };
+        let (first, second) = (parked_action(1), parked_action(2));
+        let first_tid = first.tid().clone();
+        tc.manager.park_request_key(key.clone(), first);
+        tc.manager.park_request_key(key.clone(), second);
+
+        // The server loop commits, then wakes what the queue reports.
+        tc.manager.commit_participant(&holder).await.unwrap();
+        let freed = tc.manager.take_freed_awaiting_wake();
+        assert!(freed.contains(&key), "the commit released `x`");
+
+        // Waking serves the oldest waiter, which takes the lock.
+        let ready = tc.manager.take_ready_waiters(&freed);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].tid(), &first_tid);
+        tc.manager
+            .execute_action_participant(tc.foo, &[incr_x(&tc)], &[], first_tid)
+            .await
+            .expect("the freed lock is now the first waiter's");
+        assert!(
+            tc.manager.take_freed_awaiting_wake().is_empty(),
+            "the key was taken once already; a second delivery would wake the \
+             younger waiter against the lock the first one now holds"
+        );
+        assert_eq!(
+            tc.manager.wait_queue.get(&key).map(|w| w.len()),
+            Some(1),
+            "the younger waiter must stay parked until the new holder commits"
+        );
+    }
+
+    /// A service with two independent vars, `a` and `x`
+    async fn manager_with_a_and_x() -> TestContext {
+        let mut tc = TestContext::new();
+        let a = tc.manager.interner.insert("a");
+        let zero = || Expr::Literal {
+            val: Value::Int { val: 0 },
+        };
+        let decls = vec![
+            Decl::VarDecl {
+                name: a,
+                ty: None,
+                val: zero(),
+            },
+            Decl::VarDecl {
+                name: tc.x,
+                ty: None,
+                val: zero(),
+            },
+        ];
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        tc
+    }
+
+    /// Every lock an originator transaction releases has to be reported for
+    /// waking, on the ordinary path as much as the failing one.
+    #[tokio::test]
+    async fn test_originator_reports_locks_released_on_success() {
+        let mut tc = manager_with_x().await;
+        let key = WaitKey::Member(tc.manager.service_net_id_for_name(tc.foo), tc.x);
+        let parked = parked_lookup(&tc, tc.x);
+        tc.manager.park_request_key(key.clone(), parked);
+
+        tc.manager
+            .execute_action(tc.foo, &[incr_x(&tc)])
+            .await
+            .expect("an uncontended write commits");
+
+        assert!(
+            tc.manager.take_freed_awaiting_wake().contains(&key),
+            "the committed transaction released its write lock on `x`, so the \
+             request parked on it must be reported for waking"
+        );
+    }
+
+    /// The same when the originator gives up on a contended lock, releasing
+    /// what the attempt had already locked.
+    #[tokio::test]
+    async fn test_originator_reports_locks_released_when_it_gives_up() {
+        let mut tc = manager_with_a_and_x().await;
+        let a = tc.manager.interner.insert("a");
+        let key_a = WaitKey::Member(tc.manager.service_net_id_for_name(tc.foo), a);
+
+        // A younger transaction holds `x` for the whole run.
+        tc.manager
+            .services
+            .get_mut(&tc.foo)
+            .unwrap()
+            .vars
+            .get_mut(&tc.x)
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(TxnId {
+            timestamp: u128::MAX,
+            node_id: tc.manager.node_id,
+            iteration: 0,
+        });
+
+        // Someone is parked on `a`, which the transaction locks before it
+        // contends on `x`.
+        let parked = parked_lookup(&tc, a);
+        tc.manager.park_request_key(key_a.clone(), parked);
+
+        let stmts = vec![
+            ActionStmt::Assign {
+                name: a,
+                expr: Expr::Literal {
+                    val: Value::Int { val: 1 },
+                },
+            },
+            incr_x(&tc),
+        ];
+        tc.manager
+            .execute_action(tc.foo, &stmts)
+            .await
+            .expect_err("`x` is held for the whole run");
+
+        assert!(
+            tc.manager.take_freed_awaiting_wake().contains(&key_a),
+            "the attempt released the lock it had taken on `a`, so the request \
+             parked on it must be reported for waking"
+        );
     }
 }
