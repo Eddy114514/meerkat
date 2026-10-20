@@ -6,7 +6,7 @@ pub mod free_var;
 use crate::runtime::interner::Symbol;
 use petgraph::algo::{has_path_connecting, tarjan_scc, toposort, Cycle};
 use petgraph::graphmap::DiGraphMap;
-use petgraph::visit::{Dfs, DfsPostOrder, Reversed};
+use petgraph::visit::{Dfs, DfsPostOrder, EdgeFiltered, EdgeRef, Reversed};
 use std::collections::{HashMap, HashSet};
 
 /// Pre-computed dependency graphs and analysis state for a service
@@ -67,6 +67,38 @@ impl ServiceGraphs {
             }
         }
         visited
+    }
+
+    /// Source vars of a member: the vars it reads through reactive edges, the
+    /// member itself if it is a var. The walk does not continue past a var:
+    /// its incoming edges come from its initializer, which does not make it
+    /// derived. A def that reads no var has none
+    ///
+    /// Returns:
+    ///   `Option<HashSet<Symbol>>`: The source vars, or `None` if the walk
+    ///   reaches a name that is neither a var nor a def of this service
+    pub fn source_vars(
+        &self,
+        member: Symbol,
+        cross: &mut Vec<(Symbol, Symbol)>,
+    ) -> Option<HashSet<Symbol>> {
+        // In the reversed graph an edge leaves the dependent node, so dropping
+        // the edges that leave a var keeps the walk from passing through it
+        let deps = EdgeFiltered::from_fn(Reversed(&self.reactive_graph), |edge| {
+            !self.vars.contains(&edge.source())
+        });
+        let mut dfs = Dfs::new(&deps, member);
+        let mut sources = HashSet::new();
+        while let Some(name) = dfs.next(&deps) {
+            if self.vars.contains(&name) {
+                sources.insert(name);
+            } else if self.defs.contains(&name) {
+                cross.extend(self.cross_deps.get(&name).into_iter().flatten());
+            } else {
+                return None;
+            }
+        }
+        Some(sources)
     }
 
     /// Compute strongly connected components using `petgraph::algo::tarjan_scc`

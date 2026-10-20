@@ -798,6 +798,35 @@ impl Manager {
         Some(&vars.vector_clock)
     }
 
+    /// Sources (section 5.3) of `svc.member` as clock dimensions: its source
+    /// vars, followed into the services it reads. A service not on this node
+    /// is analysed from its declaration in `unified_ast`. `None` if a member
+    /// on the way is not known
+    fn sources(&self, svc: Symbol, member: Symbol) -> Option<HashSet<(Symbol, Symbol)>> {
+        let mut sources = HashSet::new();
+        let mut seen = HashSet::new();
+        let mut pending = vec![(svc, member)];
+        while let Some((svc, member)) = pending.pop() {
+            if !seen.insert((svc, member)) {
+                continue;
+            }
+            let vars = match self.services.get(&svc) {
+                Some(service) => service.graphs.source_vars(member, &mut pending),
+                None => {
+                    let decl = self
+                        .unified_ast
+                        .iter()
+                        .find(|stmt| matches!(stmt, Stmt::Service { name, .. } if *name == svc))?;
+                    compute_dependencies(std::slice::from_ref(decl), None)
+                        .pop()?
+                        .source_vars(member, &mut pending)
+                }
+            }?;
+            sources.extend(vars.into_iter().map(|var| (svc, var)));
+        }
+        Some(sources)
+    }
+
     // helper function to apply a simultaneous bump, as described in section 5.2 of vector clock semantics
     fn simultaneous_bump(
         &mut self,
@@ -881,8 +910,9 @@ impl Manager {
     // compute v_target from vector clock semantics 5.3 by taking max over all dependent vector clocks
     // then, determine whether it is glitch-free or not
     fn compute_v_target(&self, curr_svc: &Service, def: &Symbol) -> (VClock, bool) {
-        // get all vclocks of dependencies
-        let mut vclocks: Vec<&VClock> = Vec::new();
+        // get all vclocks of dependencies, each with the sources its input
+        // reads (None: not known)
+        let mut vclocks = Vec::new();
 
         // ServiceGraphs stores source -> dependent edges. Incoming reactive
         // neighbors are the local inputs formerly held in dep.dep_graph[def].
@@ -892,35 +922,55 @@ impl Manager {
             .neighbors_directed(*def, petgraph::Direction::Incoming)
         {
             match curr_svc.vars.get(&name) {
-                Some(vs) => vclocks.push(&vs.vector_clock),
-                None => log::warn!(
-                    "gate: local dep '{}' of def '{}' missing from vars",
-                    self.interner.get(name),
-                    self.interner.get(*def),
-                ),
+                Some(vs) => vclocks.push((&vs.vector_clock, self.sources(curr_svc.name, name))),
+                None => {
+                    log::warn!(
+                        "gate: local dep '{}' of def '{}' missing from vars",
+                        self.interner.get(name),
+                        self.interner.get(*def),
+                    );
+                    // an input without a clock cannot be part of a batch
+                    return (HashMap::new(), false);
+                }
             }
         }
 
-        // cross-service inputs
-        if let Some(deps) = curr_svc.dep_cache.get(def) {
-            for (_, clk) in deps.values() {
-                vclocks.push(clk);
+        // cross-service inputs, each with the clock of the value eval reads:
+        // the cached Update if there is one, else the owner's stored member if
+        // it is on this node. A remote member without an Update would be
+        // fetched without its clock, so wait for the Update
+        for &(owner, member) in curr_svc.graphs.cross_deps.get(def).into_iter().flatten() {
+            let cached = curr_svc
+                .dep_cache
+                .get(def)
+                .and_then(|deps| deps.get(&(owner, member)));
+            let clock = match cached {
+                Some((_, clock)) => Some(clock),
+                None if self.remote_services.contains_key(&owner) => None,
+                None => self.get_clock(&owner, &member),
+            };
+            match clock {
+                Some(clock) => vclocks.push((clock, self.sources(owner, member))),
+                None => return (HashMap::new(), false),
             }
         }
 
         // compute v_target by taking max over all dependent vector clocks
         let mut v_target: VClock = HashMap::new();
-        for clk in &vclocks {
+        for (clk, _) in &vclocks {
             for (dim, &c) in *clk {
                 let e = v_target.entry(*dim).or_insert(0);
                 *e = (*e).max(c);
             }
         }
-        // gate: every input clock is >= v_target
-        let gate_ok = vclocks.iter().all(|clk| {
-            v_target
-                .iter()
-                .all(|(dim, &t)| clk.get(dim).copied().unwrap_or(0) >= t)
+        // gate (section 5.3): every input clock is >= v_target on each source
+        // its input reads, a missing entry counting as 0. An input whose
+        // sources are not known is checked on every dimension
+        let gate_ok = vclocks.iter().all(|(clk, sources)| {
+            v_target.iter().all(|(dim, &t)| {
+                sources.as_ref().is_some_and(|s| !s.contains(dim))
+                    || clk.get(dim).copied().unwrap_or(0) >= t
+            })
         });
         (v_target, gate_ok)
     }
@@ -928,7 +978,7 @@ impl Manager {
     /// #24: recompute `def` in `svc` from current values, seeding the reactive
     /// cache with this def's cached cross-service deps so MemberAccess resolves
     /// from cache instead of a (possibly remote) lookup. Returns whether the
-    /// stored value changed.
+    /// stored value or its clock changed.
     ///
     /// Vector clock PR update: to make sure that recomputing defs is safe
     /// we add a check against the vector clocks of the dependencies of the def.
@@ -1014,7 +1064,9 @@ impl Manager {
                 .and_then(|s| s.vars.get_mut(&def))
             {
                 Some(var_state) => {
-                    let differs = var_state.value != value;
+                    // listeners gate on the clock, so a clock that moved
+                    // under an unchanged value must still reach them
+                    let differs = var_state.value != value || var_state.vector_clock != v_target;
                     var_state.value = value;
                     var_state.vector_clock = v_target;
                     differs
@@ -2350,7 +2402,9 @@ impl Manager {
         // for now, we don't need the resulting v_base, but we will in the future
         self.simultaneous_bump(&read_set, &write_set); // returns V_new; discarded in M1
         let error = self.commit_participants(txn).await;
-        self.forget_participant_deps(txn);
+        for (listener, def, owner, member) in self.forget_participant_deps(txn) {
+            self.subscribe_remote(owner, member, listener, def).await;
+        }
         for (sid, var) in txn.written.keys() {
             if let Some(name) = self.service_name_for_net_id(sid) {
                 self.propagate(name, *var).await;
@@ -2376,17 +2430,21 @@ impl Manager {
     }
 
     /// Drop the cached values of remote members owned by a transaction's
-    /// participants
+    /// participants, returning each dropped `(listener, def, owner, member)`
     ///
     /// `dep_cache` holds whatever the last `Update` delivered, and a
     /// participant's `Update` for this commit can arrive after its
     /// `CommitResponse`. Recomputing from the cache would then pair this node's
-    /// new writes with the participant's old values. Without the entries, the
-    /// recompute looks the members up from the participant, which has already
-    /// committed. The next `Update` refills them
-    fn forget_participant_deps(&mut self, txn: &Transaction) {
+    /// new writes with the participant's old values. Without an entry the gate
+    /// waits; the caller subscribes again, and the participant, which has
+    /// already committed, answers with its current value and clock
+    fn forget_participant_deps(
+        &mut self,
+        txn: &Transaction,
+    ) -> Vec<(ServiceNetId, Symbol, Symbol, Symbol)> {
+        let mut forgotten = Vec::new();
         if txn.participants.is_empty() {
-            return;
+            return forgotten;
         }
         let owned_by_participants: HashSet<Symbol> = self
             .remote_services
@@ -2398,10 +2456,17 @@ impl Manager {
             })
             .collect();
         for service in self.services.values_mut() {
-            for cache in service.dep_cache.values_mut() {
-                cache.retain(|(owner, _), _| !owned_by_participants.contains(owner));
+            for (def, cache) in service.dep_cache.iter_mut() {
+                cache.retain(|&(owner, member), _| {
+                    let keep = !owned_by_participants.contains(&owner);
+                    if !keep {
+                        forgotten.push((service.id.clone(), *def, owner, member));
+                    }
+                    keep
+                });
             }
         }
+        forgotten
     }
 
     /// Participant side: execute a composed action under a shared transaction
@@ -3752,21 +3817,30 @@ mod tests {
     }
 
     // Build `s2` whose only def is the remote-diamond sink `z = s1.a + s1.b`,
-    // and return its network id. `s1` owns `a` and `b` as members; their local
-    // values are sentinels (0) so that if `z` ever computed from a local
-    // fallback instead of its delivered dep_cache, the result would be visibly
-    // wrong rather than coincidentally correct.
+    // and return its network id. `s1` derives `a = w + 10` and `b = w + 20`,
+    // so `w` is the source both arms share; their local values (10, 20) are
+    // sentinels so that if `z` ever computed from a local fallback instead of
+    // its delivered dep_cache, the result would be visibly wrong rather than
+    // coincidentally correct.
     async fn setup_remote_diamond(tc: &mut TestContext, a: Symbol, b: Symbol, z: Symbol) -> String {
+        let w = || Expr::Variable { name: tc.w };
         let s1_decls = vec![
             Decl::VarDecl {
-                name: a,
+                name: tc.w,
                 ty: None,
                 val: lit_int(0),
             },
-            Decl::VarDecl {
+            Decl::DefDecl {
+                name: a,
+                ty: None,
+                val: mk_add(w(), lit_int(10)),
+                is_pub: true,
+            },
+            Decl::DefDecl {
                 name: b,
                 ty: None,
-                val: lit_int(0),
+                val: mk_add(w(), lit_int(20)),
+                is_pub: true,
             },
         ];
         tc.manager.create_service(tc.s1, s1_decls).await.unwrap();
