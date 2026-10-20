@@ -21,6 +21,8 @@ pub struct ServiceGraphs {
     pub defs: HashSet<Symbol>,
     /// Set of table symbols defined in the service
     pub tables: HashSet<Symbol>,
+    /// Cached source variables per member, stored as (service, variable) pairs
+    pub local_sources: HashMap<Symbol, HashSet<(Symbol, Symbol)>>,
 }
 
 impl ServiceGraphs {
@@ -35,7 +37,30 @@ impl ServiceGraphs {
             vars: HashSet::new(),
             defs: HashSet::new(),
             tables: HashSet::new(),
+            local_sources: HashMap::new(),
         }
+    }
+
+    /// Prepare complete local source sets when this graph is installed.
+    /// Cross-service and unknown sources keep using the regular analysis path.
+    pub(crate) fn prepare_local_sources(&mut self, service: Symbol) {
+        let mut local_sources = HashMap::new();
+        // Potential optimization: reuse upstream source sets in dependency order.
+        // For a single-source chain A -> B -> C (input -> dependent), compute A first
+        // and reuse its sources for B and C. This reduces total preparation time
+        // from O(n^2) to O(n).
+        // Handle cycles by grouping nodes into SCCs and processing dependencies first.
+        // SCC processing and set merging/copying may outweigh the savings on some graphs.
+        for &member in self.vars.iter().chain(&self.defs) {
+            let mut cross = Vec::new();
+            if let Some(vars) = self.source_vars(member, &mut cross) {
+                if cross.is_empty() {
+                    local_sources
+                        .insert(member, vars.into_iter().map(|var| (service, var)).collect());
+                }
+            }
+        }
+        self.local_sources = local_sources;
     }
 
     /// Extract all reactive propagation listener edges as `(owner, listener)`

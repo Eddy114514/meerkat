@@ -10,6 +10,7 @@ use crate::net::{
 };
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::txn::{Transaction, TxnId, VClock, VarState, WaitKey};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
@@ -598,9 +599,10 @@ impl Manager {
     ///
     /// Returns:
     ///     `()`
-    pub async fn update_service_graphs(&mut self, svc_name: Symbol, new_graphs: ServiceGraphs) {
+    pub async fn update_service_graphs(&mut self, svc_name: Symbol, mut new_graphs: ServiceGraphs) {
         let (updated_id, edges) = match self.services.get_mut(&svc_name) {
             Some(service) => {
+                new_graphs.prepare_local_sources(svc_name);
                 service.graphs = new_graphs;
                 let updated_id = service.id.clone();
                 let mut edges: Vec<(Symbol, Symbol, Symbol)> = Vec::new();
@@ -801,8 +803,17 @@ impl Manager {
     /// Sources (section 5.3) of `svc.member` as clock dimensions: its source
     /// vars, followed into the services it reads. A service not on this node
     /// is analysed from its declaration in `unified_ast`. `None` if a member
-    /// on the way is not known
-    fn sources(&self, svc: Symbol, member: Symbol) -> Option<HashSet<(Symbol, Symbol)>> {
+    /// on the way is not known. Complete local results are borrowed from the
+    /// installed graph; queries involving other services keep the original walk.
+    fn sources(&self, svc: Symbol, member: Symbol) -> Option<Cow<'_, HashSet<(Symbol, Symbol)>>> {
+        if let Some(sources) = self
+            .services
+            .get(&svc)
+            .and_then(|service| service.graphs.local_sources.get(&member))
+        {
+            return Some(Cow::Borrowed(sources));
+        }
+
         let mut sources = HashSet::new();
         let mut seen = HashSet::new();
         let mut pending = vec![(svc, member)];
@@ -824,7 +835,7 @@ impl Manager {
             }?;
             sources.extend(vars.into_iter().map(|var| (svc, var)));
         }
-        Some(sources)
+        Some(Cow::Owned(sources))
     }
 
     // helper function to apply a simultaneous bump, as described in section 5.2 of vector clock semantics
