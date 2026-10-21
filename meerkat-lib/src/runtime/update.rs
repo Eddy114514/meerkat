@@ -444,7 +444,7 @@ impl Transaction {
     ///     `manager` (`&mut Manager`): The active runtime manager
     fn commit(&mut self, manager: &mut Manager) {
         debug_assert_eq!(self.state, TransactionState::Evaluated);
-        manager.unified_ast = std::mem::take(&mut self.ast);
+        manager.install_analyzed_ast(std::mem::take(&mut self.ast), &mut self.deps);
         manager.local_services = std::mem::replace(&mut self.types, Env::new(None));
 
         for ((svc_name, var_name), val) in std::mem::take(&mut self.values) {

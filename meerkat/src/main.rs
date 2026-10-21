@@ -510,7 +510,7 @@ async fn init_server_services(
 ) -> Result<(), Box<dyn Error>> {
     // `register_and_instantiate_imports` walks this, and runtime updates
     // against remote services resolve their targets through it.
-    manager.unified_ast = full_ast;
+    manager.install_unified_ast(full_ast);
 
     manager
         .register_and_instantiate_imports(prog, remote_url_map)
@@ -1086,7 +1086,7 @@ async fn run_client(
     // Pre-populate unified_ast with the full AST (including remote imports)
     // so that runtime updates against remote services can successfully find
     // the target service definitions to patch against and type-check.
-    manager.unified_ast = full_ast;
+    manager.install_unified_ast(full_ast);
 
     // Start the network if we have remote imports, or always in watch mode
     // (watch needs the network to receive change notifications).

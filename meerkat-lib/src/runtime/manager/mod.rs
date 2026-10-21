@@ -132,8 +132,10 @@ pub struct Manager {
     /// #24: reply address for each remote listener, keyed by the listener's
     /// ServiceNetId, so the owner can route Updates back to it.
     pub listener_addrs: HashMap<ServiceNetId, String>,
-    /// Global unified AST of all services running on this manager
+    /// Installed declarations, including services without a local instance
     pub unified_ast: Vec<Stmt>,
+    /// Graphs for installed declarations without a local service instance
+    declaration_graphs: HashMap<Symbol, ServiceGraphs>,
     /// Global local services type environment
     pub local_services: Env<'static, ServiceType>,
 }
@@ -168,8 +170,56 @@ impl Manager {
             reactive_cache: None,
             listener_addrs: HashMap::new(),
             unified_ast: Vec::new(),
+            declaration_graphs: HashMap::new(),
             local_services: Env::new(None),
         }
+    }
+
+    /// Install initial or imported declarations and retain their analyzed graphs.
+    /// Running services keep their graphs; code updates install those separately.
+    pub fn install_unified_ast(&mut self, ast: Vec<Stmt>) {
+        let mut graphs = HashMap::new();
+        for stmt in &ast {
+            if let Stmt::Service { name, .. } = stmt {
+                if !self.services.contains_key(name) {
+                    if let Some(graph) =
+                        compute_dependencies(std::slice::from_ref(stmt), None).pop()
+                    {
+                        graphs.insert(*name, graph);
+                    }
+                }
+            }
+        }
+        self.install_analyzed_ast(ast, &mut graphs);
+    }
+
+    /// Install committed declarations, moving only graphs without local instances.
+    /// Leave local candidates for update_service_graphs and listener installation.
+    pub(crate) fn install_analyzed_ast(
+        &mut self,
+        ast: Vec<Stmt>,
+        graphs: &mut HashMap<Symbol, ServiceGraphs>,
+    ) {
+        self.declaration_graphs = ast
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Service { name, .. } if !self.services.contains_key(name) => {
+                    graphs.remove(name).map(|mut graph| {
+                        graph.prepare_local_sources(*name);
+                        (*name, graph)
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        self.unified_ast = ast;
+    }
+
+    fn service_graphs(&self, service: Symbol) -> Option<&ServiceGraphs> {
+        self.services
+            .get(&service)
+            .map(|service| &service.graphs)
+            .or_else(|| self.declaration_graphs.get(&service))
     }
 
     /// Park a request on the wait queue for the contended `WaitKey`
@@ -407,31 +457,13 @@ impl Manager {
             });
         }
 
-        let all_graphs = compute_dependencies(&self.unified_ast, None);
-        let service_stmts: Vec<_> = self
-            .unified_ast
-            .iter()
-            .filter_map(|stmt| {
-                if let Stmt::Service { name: existing, .. } = stmt {
-                    Some(*existing)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        debug_assert_eq!(
-            service_stmts.len(),
-            all_graphs.len(),
-            "Service statement count must match graph count"
-        );
-
-        let graphs = service_stmts
-            .into_iter()
-            .zip(all_graphs)
-            .find(|(svc_name, _)| *svc_name == name)
-            .map(|(_, g)| g)
-            .unwrap_or_else(ServiceGraphs::new);
+        let graphs = self.declaration_graphs.remove(&name).unwrap_or_else(|| {
+            self.unified_ast
+                .iter()
+                .find(|stmt| matches!(stmt, Stmt::Service { name: existing, .. } if *existing == name))
+                .and_then(|decl| compute_dependencies(std::slice::from_ref(decl), None).pop())
+                .unwrap_or_default()
+        });
 
         self.services.insert(
             name,
@@ -522,45 +554,26 @@ impl Manager {
         let mut commit_error = None;
         if init_error.is_none() {
             commit_error = self.commit_txn(&txn).await;
-
-            // #24: now that init succeeded, register listener edges so
-            // a change to a member notifies the defs that depend on it
-            // #98: also skip when a participant commit failed -- that
-            // service is about to be rolled back below, so it must not
-            // wire up listeners
-            if commit_error.is_none() {
-                self.update_service_graphs(svc_name, graphs).await;
-            }
-
-            // #98: a participant failed to commit. Participants here only hold
-            // read locks (initialization never runs actions), so nothing is left
-            // half-applied: remove the service, mirroring the init-failure path,
-            // and abort participants to release any locks still held. The
-            // captured error is returned below
-            if commit_error.is_some() {
-                for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                    self.send_abort(addr, &txn.id).await;
-                }
-                self.services.remove(&svc_name);
-            }
+        }
+        if init_error.is_none() && commit_error.is_none() {
+            // Install listeners only after initialization and commit succeed.
+            self.update_service_graphs(svc_name, graphs).await;
         } else {
-            // Execution failed: discard buffered writes and abort participants.
+            // Initialization only reads participants. Abort releases their locks.
             for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                 self.send_abort(addr, &txn.id).await;
             }
             self.services.remove(&svc_name);
-        }
-
-        // Clean up the global unified_ast if initialization or commit failed
-        // to prevent phantom services from lingering in the AST
-        if (init_error.is_some() || commit_error.is_some()) && inserted {
-            self.unified_ast.retain(|s| {
-                if let Stmt::Service { name: existing, .. } = s {
-                    *existing != svc_name
-                } else {
-                    true
-                }
-            });
+            if inserted {
+                self.unified_ast.retain(
+                    |stmt| !matches!(stmt, Stmt::Service { name, .. } if *name == svc_name),
+                );
+            } else {
+                // A failed local instance must not erase an existing import.
+                let mut graphs = graphs;
+                graphs.prepare_local_sources(svc_name);
+                self.declaration_graphs.insert(svc_name, graphs);
+            }
         }
 
         // Release all locks held locally (always, even on error)
@@ -801,15 +814,13 @@ impl Manager {
     }
 
     /// Sources (section 5.3) of `svc.member` as clock dimensions: its source
-    /// vars, followed into the services it reads. A service not on this node
-    /// is analysed from its declaration in `unified_ast`. `None` if a member
-    /// on the way is not known. Complete local results are borrowed from the
-    /// installed graph; queries involving other services keep the original walk.
+    /// vars, followed into the services it reads. Use each service's installed
+    /// instance or declaration graph. `None` if a member on the way is not known.
+    /// Complete local results are borrowed; cross-service walks reuse them too.
     fn sources(&self, svc: Symbol, member: Symbol) -> Option<Cow<'_, HashSet<(Symbol, Symbol)>>> {
         if let Some(sources) = self
-            .services
-            .get(&svc)
-            .and_then(|service| service.graphs.local_sources.get(&member))
+            .service_graphs(svc)
+            .and_then(|graphs| graphs.local_sources.get(&member))
         {
             return Some(Cow::Borrowed(sources));
         }
@@ -821,18 +832,12 @@ impl Manager {
             if !seen.insert((svc, member)) {
                 continue;
             }
-            let vars = match self.services.get(&svc) {
-                Some(service) => service.graphs.source_vars(member, &mut pending),
-                None => {
-                    let decl = self
-                        .unified_ast
-                        .iter()
-                        .find(|stmt| matches!(stmt, Stmt::Service { name, .. } if *name == svc))?;
-                    compute_dependencies(std::slice::from_ref(decl), None)
-                        .pop()?
-                        .source_vars(member, &mut pending)
-                }
-            }?;
+            let graphs = self.service_graphs(svc)?;
+            if let Some(cached) = graphs.local_sources.get(&member) {
+                sources.extend(cached);
+                continue;
+            }
+            let vars = graphs.source_vars(member, &mut pending)?;
             sources.extend(vars.into_iter().map(|var| (svc, var)));
         }
         Some(Cow::Owned(sources))
