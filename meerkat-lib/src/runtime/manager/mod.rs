@@ -132,7 +132,7 @@ pub struct Manager {
     /// #24: reply address for each remote listener, keyed by the listener's
     /// ServiceNetId, so the owner can route Updates back to it.
     pub listener_addrs: HashMap<ServiceNetId, String>,
-    /// Installed declarations, including services without a local instance
+    /// Installed declarations and imports, excluding executable program statements
     pub unified_ast: Vec<Stmt>,
     /// Graphs for installed declarations without a local service instance
     declaration_graphs: HashMap<Symbol, ServiceGraphs>,
@@ -197,9 +197,17 @@ impl Manager {
     /// Leave local candidates for update_service_graphs and listener installation.
     pub(crate) fn install_analyzed_ast(
         &mut self,
-        ast: Vec<Stmt>,
+        mut ast: Vec<Stmt>,
         graphs: &mut HashMap<Symbol, ServiceGraphs>,
     ) {
+        // Node validates top-level statements against the final program state;
+        // the caller keeps them for execution. Updates check only current declarations.
+        ast.retain(|stmt| {
+            matches!(
+                stmt,
+                Stmt::Service { .. } | Stmt::Import { .. } | Stmt::Connect { .. }
+            )
+        });
         self.declaration_graphs = ast
             .iter()
             .filter_map(|stmt| match stmt {
@@ -458,11 +466,13 @@ impl Manager {
         }
 
         let graphs = self.declaration_graphs.remove(&name).unwrap_or_else(|| {
-            self.unified_ast
+            let mut graphs = self.unified_ast
                 .iter()
                 .find(|stmt| matches!(stmt, Stmt::Service { name: existing, .. } if *existing == name))
                 .and_then(|decl| compute_dependencies(std::slice::from_ref(decl), None).pop())
-                .unwrap_or_default()
+                .unwrap_or_default();
+            graphs.prepare_local_sources(name);
+            graphs
         });
 
         self.services.insert(
@@ -557,7 +567,7 @@ impl Manager {
         }
         if init_error.is_none() && commit_error.is_none() {
             // Install listeners only after initialization and commit succeed.
-            self.update_service_graphs(svc_name, graphs).await;
+            self.install_prepared_service_graphs(svc_name, graphs).await;
         } else {
             // Initialization only reads participants. Abort releases their locks.
             for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
@@ -570,8 +580,6 @@ impl Manager {
                 );
             } else {
                 // A failed local instance must not erase an existing import.
-                let mut graphs = graphs;
-                graphs.prepare_local_sources(svc_name);
                 self.declaration_graphs.insert(svc_name, graphs);
             }
         }
@@ -613,9 +621,19 @@ impl Manager {
     /// Returns:
     ///     `()`
     pub async fn update_service_graphs(&mut self, svc_name: Symbol, mut new_graphs: ServiceGraphs) {
+        new_graphs.prepare_local_sources(svc_name);
+        self.install_prepared_service_graphs(svc_name, new_graphs)
+            .await;
+    }
+
+    /// Install a graph whose local sources are ready and refresh its listeners.
+    async fn install_prepared_service_graphs(
+        &mut self,
+        svc_name: Symbol,
+        new_graphs: ServiceGraphs,
+    ) {
         let (updated_id, edges) = match self.services.get_mut(&svc_name) {
             Some(service) => {
-                new_graphs.prepare_local_sources(svc_name);
                 service.graphs = new_graphs;
                 let updated_id = service.id.clone();
                 let mut edges: Vec<(Symbol, Symbol, Symbol)> = Vec::new();
