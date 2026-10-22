@@ -386,8 +386,9 @@ impl Transaction {
                                 Decl::DefDecl {
                                     name: decl_name, ..
                                 } => {
-                                    manager.recompute_def(*svc_name, *decl_name).await;
-                                    manager.propagate(*svc_name, *decl_name).await;
+                                    if manager.recompute_def(*svc_name, *decl_name).await {
+                                        manager.propagate(*svc_name, *decl_name).await;
+                                    }
                                 }
                                 Decl::TableDecl { .. } => {}
                             }

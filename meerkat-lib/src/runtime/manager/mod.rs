@@ -3035,6 +3035,7 @@ mod tests {
     use super::*;
     use crate::ast::{Decl, Expr, Value};
     use crate::runtime::interpreter::execute;
+    use crate::runtime::{parser::parse_string, update::Transaction as CodeUpdate, Node};
 
     // #24: cross_service_deps pulls out exactly the (service, member) symbols
     // referenced via MemberAccess, and nothing for a purely local expression.
@@ -5856,5 +5857,123 @@ mod tests {
             "the attempt released the lock it had taken on `a`, so the request \
              parked on it must be reported for waking"
         );
+    }
+
+    async fn start_local_manager(code: &str) -> Manager {
+        let mut node = Node::new();
+        node.unified_ast = parse_string(code, &mut node.interner).unwrap();
+        node.static_checks().unwrap();
+        let ast = node.unified_ast.clone();
+        node.on_manager_startup(true, None, HashMap::new(), &ast)
+            .await
+            .unwrap()
+    }
+
+    async fn update_service_code(manager: &mut Manager, code: &str) {
+        let ast = parse_string(code, &mut manager.interner).unwrap();
+        CodeUpdate::new(ast).poll(manager).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shrinking_sources_removes_old_source_and_listener() {
+        let mut manager = start_local_manager(
+            "service s {
+                var x = 1;
+                var y = 2;
+                pub def a = x + y;
+                pub def b = a + 1;
+            }",
+        )
+        .await;
+        let [s, x, y, a, b] = ["s", "x", "y", "a", "b"].map(|name| manager.interner.insert(name));
+        let original = HashSet::from([(s, x), (s, y)]);
+        assert_eq!(manager.sources(s, a).as_deref(), Some(&original));
+        assert_eq!(manager.services[&s].graphs.local_sources[&b], original);
+        let listener = (manager.services[&s].id.clone(), a);
+        assert!(manager.services[&s].listeners[&y].contains(&listener));
+
+        update_service_code(&mut manager, "update s { pub def a = x; }").await;
+
+        let expected = HashSet::from([(s, x)]);
+        assert_eq!(manager.services[&s].graphs.local_sources[&a], expected);
+        assert_eq!(manager.services[&s].graphs.local_sources[&b], expected);
+        assert_eq!(manager.sources(s, a).as_deref(), Some(&expected));
+        assert!(manager.services[&s].listeners[&x].contains(&listener));
+        assert!(!manager.services[&s]
+            .listeners
+            .get(&y)
+            .is_some_and(|listeners| listeners.contains(&listener)));
+        assert_eq!(manager.services[&s].vars[&a].value, Value::Int { val: 1 });
+        assert_eq!(manager.services[&s].vars[&b].value, Value::Int { val: 2 });
+
+        manager
+            .assign(s, y, Value::Int { val: 20 }, None)
+            .await
+            .unwrap();
+        assert_eq!(manager.services[&s].vars[&a].value, Value::Int { val: 1 });
+        assert!(manager.services[&s].vars[&a].vector_clock.is_empty());
+        assert_eq!(manager.services[&s].vars[&b].value, Value::Int { val: 2 });
+        assert!(manager.services[&s].vars[&b].vector_clock.is_empty());
+
+        manager
+            .assign(s, x, Value::Int { val: 7 }, None)
+            .await
+            .unwrap();
+        let clock = HashMap::from([((s, x), 1)]);
+        assert_eq!(manager.services[&s].vars[&a].value, Value::Int { val: 7 });
+        assert_eq!(manager.services[&s].vars[&a].vector_clock, clock);
+        assert_eq!(manager.services[&s].vars[&b].value, Value::Int { val: 8 });
+        assert_eq!(manager.services[&s].vars[&b].vector_clock, clock);
+    }
+
+    #[test]
+    fn imported_declaration_replacement_refreshes_unchanged_consumer_sources() {
+        // Declaration-only queries isolate installation from network delivery.
+        // The other tests exercise live services, listeners, and stored results.
+        let mut manager = Manager::new(Interner::new());
+        let ast = parse_string(
+            "service A {
+                var x = 1;
+                var y = 1;
+                pub def a = x + 1;
+            }
+            service B { pub def z = A.a + 1; }",
+            &mut manager.interner,
+        )
+        .unwrap();
+        manager.install_unified_ast(ast);
+        let [owner, consumer, x, y, a, z] =
+            ["A", "B", "x", "y", "a", "z"].map(|name| manager.interner.insert(name));
+        let consumer_decl = manager.unified_ast[1].clone();
+        let cross_deps = manager.declaration_graphs[&consumer].cross_deps.clone();
+        assert!(manager.services.is_empty());
+        assert!(!manager.declaration_graphs[&consumer]
+            .local_sources
+            .contains_key(&z));
+        assert_eq!(
+            manager.sources(consumer, z).as_deref(),
+            Some(&HashSet::from([(owner, x)]))
+        );
+
+        let mut declarations = parse_string(
+            "service A {
+                var x = 1;
+                var y = 1;
+                pub def a = y + 1;
+            }",
+            &mut manager.interner,
+        )
+        .unwrap();
+        declarations.push(consumer_decl.clone());
+        manager.install_unified_ast(declarations);
+
+        assert_eq!(manager.unified_ast[1], consumer_decl);
+        assert_eq!(manager.declaration_graphs[&consumer].cross_deps, cross_deps);
+        let expected = HashSet::from([(owner, y)]);
+        assert_eq!(
+            manager.declaration_graphs[&owner].local_sources[&a],
+            expected
+        );
+        assert_eq!(manager.sources(consumer, z).as_deref(), Some(&expected));
     }
 }
