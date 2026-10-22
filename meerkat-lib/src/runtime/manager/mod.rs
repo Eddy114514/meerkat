@@ -1063,6 +1063,9 @@ impl Manager {
         let (v_target, gate_ok) = self.compute_v_target(curr_svc, &def);
 
         if gate_ok {
+            // A remote read can process an Update and re-enter recompute_def.
+            // Preserve the cache of the suspended outer evaluation.
+            let outer_cache = self.reactive_cache.take();
             self.reactive_cache = Some(cache);
 
             let result = eval(
@@ -1076,10 +1079,9 @@ impl Manager {
             )
             .await;
 
-            // The reactive cache is only valid for the single recompute above (its
-            // entries are this def's cached cross-service deps), so clear it before
-            // returning to avoid leaking stale entries into later evaluations.
-            self.reactive_cache = None;
+            // Restore on success and error. If propagation becomes cancellable,
+            // this must also handle a dropped evaluation future.
+            self.reactive_cache = outer_cache;
 
             let value = match result {
                 Ok(v) => v,
@@ -1092,18 +1094,22 @@ impl Manager {
                     return false;
                 }
             };
-            match self
-                .services
-                .get_mut(&svc)
-                .and_then(|s| s.vars.get_mut(&def))
-            {
-                Some(var_state) => {
-                    // listeners gate on the clock, so a clock that moved
-                    // under an unchanged value must still reach them
-                    let differs = var_state.value != value || var_state.vector_clock != v_target;
-                    var_state.value = value;
-                    var_state.vector_clock = v_target;
-                    differs
+            match self.services.get_mut(&svc) {
+                Some(service) => {
+                    if let Some(var_state) = service.vars.get_mut(&def) {
+                        // listeners gate on the clock, so a clock that moved
+                        // under an unchanged value must still reach them
+                        let differs =
+                            var_state.value != value || var_state.vector_clock != v_target;
+                        var_state.value = value;
+                        var_state.vector_clock = v_target;
+                        differs
+                    } else {
+                        let mut var_state = VarState::new(value);
+                        var_state.vector_clock = v_target;
+                        service.vars.insert(def, var_state);
+                        true
+                    }
                 }
                 None => {
                     log::warn!(
