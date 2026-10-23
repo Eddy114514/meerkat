@@ -486,7 +486,7 @@ impl Manager {
                 name,
                 vars: HashMap::new(),
                 defs: HashMap::new(),
-                graphs: ServiceGraphs::new(),
+                graphs,
                 listeners: HashMap::new(),
                 dep_cache: HashMap::new(),
                 pending_source_updates: HashSet::new(),
@@ -545,9 +545,21 @@ impl Manager {
                             break;
                         }
                     };
+                    let mut vector_clock = VClock::new();
+                    // Remote lookups return no clock and can dispatch Updates while
+                    // waiting. Only inherit local clocks when initialization has
+                    // not read remotely, so they still match the evaluated values.
+                    if txn.participants.is_empty() {
+                        let (target, gate_ok) =
+                            self.compute_v_target(&self.services[&svc_name], &name);
+                        if gate_ok {
+                            vector_clock = target;
+                        }
+                    }
                     env.push((name, value.clone()));
                     if let Some(service) = self.services.get_mut(&svc_name) {
                         let mut var_value = VarState::new(value);
+                        var_value.vector_clock = vector_clock;
                         var_value.latest_write_txn = Some(txn.id.clone());
                         service.vars.insert(name, var_value);
                         service.defs.insert(name, val); // store original expr
@@ -561,6 +573,10 @@ impl Manager {
                 }
             }
         }
+
+        // The prepared graph was available for initialization's Sources checks;
+        // install its listeners only after the transaction commits successfully.
+        let graphs = std::mem::take(&mut self.services.get_mut(&svc_name).unwrap().graphs);
 
         // #87: commit on success, abort and roll back on failure (pattern from
         // execute_action_with_txn).
@@ -1063,13 +1079,12 @@ impl Manager {
     /// the stored pair changed, or a committed code update is still pending.
     /// Gate rejection and evaluation failure preserve the pending notification.
     pub(crate) async fn recompute_def(&mut self, svc: Symbol, def: Symbol) -> bool {
-        let expr = match self
+        let (curr_svc, expr) = match self
             .services
             .get(&svc)
-            .and_then(|s| s.defs.get(&def))
-            .cloned()
+            .and_then(|service| service.defs.get(&def).map(|expr| (service, expr)))
         {
-            Some(e) => e,
+            Some(input) => input,
             None => {
                 log::warn!(
                     "recompute_def: def '{}' not found in service '{}'",
@@ -1079,34 +1094,22 @@ impl Manager {
                 return false;
             }
         };
-        let env: Vec<(Symbol, Value)> = self
-            .services
-            .get(&svc)
-            .map(|s| s.vars.iter().map(|(k, v)| (*k, v.value.clone())).collect())
-            .unwrap_or_default();
-        let cache = self
-            .services
-            .get(&svc)
-            .and_then(|s| s.dep_cache.get(&def))
-            // remove vector clocks for dep_cache to get reactive_cache to typecheck
-            .map(|m| m.iter().map(|(k, (v, _clk))| (*k, v.clone())).collect())
-            .unwrap_or_default();
-
-        let curr_svc = match self.services.get(&svc) {
-            Some(svc) => svc,
-            None => {
-                log::warn!(
-                    "recompute_def: def '{}' not found in service '{}'",
-                    self.interner.get(def),
-                    self.interner.get(svc)
-                );
-                return false;
-            }
-        };
-
         let (v_target, gate_ok) = self.compute_v_target(curr_svc, &def);
 
         if gate_ok {
+            let expr = expr.clone();
+            let env: Vec<(Symbol, Value)> = curr_svc
+                .vars
+                .iter()
+                .map(|(k, v)| (*k, v.value.clone()))
+                .collect();
+            let cache = curr_svc
+                .dep_cache
+                .get(&def)
+                // Evaluation uses the values paired with the checked clocks.
+                .map(|m| m.iter().map(|(k, (v, _clk))| (*k, v.clone())).collect())
+                .unwrap_or_default();
+
             // A remote read can process an Update and re-enter recompute_def.
             // Preserve the cache of the suspended outer evaluation.
             let outer_cache = self.reactive_cache.take();

@@ -797,7 +797,8 @@ async fn test_integration_create_service_rollback_cleans_ast() {
     );
 }
 
-// Hot updates must publish only after recomputation produces a changed pair.
+// Hot updates publish after successful recomputation when the value/clock pair
+// changes or a source-change notification is pending.
 async fn listening_node() -> (NetworkActor, Address) {
     let mut network = NetworkActor::new(NodeType::Server).await.unwrap();
     let NetworkReply::ListenSuccess { addr } = network
