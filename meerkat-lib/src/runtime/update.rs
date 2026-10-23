@@ -335,22 +335,20 @@ impl Transaction {
                 self.state = TransactionState::Evaluated;
                 self.commit(manager);
 
-                let updated_svc_names: HashSet<Symbol> = self
+                let updated_services: Vec<_> = self
                     .updates
                     .iter()
                     .filter_map(|stmt| match stmt {
-                        Stmt::Service { name, .. } => Some(*name),
-                        Stmt::Update {
-                            service_name: name, ..
-                        } => Some(*name),
-                        Stmt::ActionStmt(_)
-                        | Stmt::Atomic { .. }
-                        | Stmt::Connect { .. }
-                        | Stmt::Import { .. }
-                        | Stmt::Test { .. }
-                        | Stmt::Watch { .. } => None,
+                        Stmt::Service { name, decls }
+                        | Stmt::Update {
+                            service_name: name,
+                            decls,
+                        } => Some((name, decls)),
+                        _ => None,
                     })
                     .collect();
+                let updated_svc_names: HashSet<_> =
+                    updated_services.iter().map(|(name, _)| **name).collect();
 
                 for updated_svc_name in updated_svc_names {
                     if let Some(dep) = self.deps.remove(&updated_svc_name) {
@@ -361,20 +359,20 @@ impl Transaction {
                     }
                 }
 
-                for stmt in &self.updates {
-                    let (svc_name, decls) = match stmt {
-                        Stmt::Service { name, decls } => (name, decls),
-                        Stmt::Update {
-                            service_name: name,
-                            decls,
-                        } => (name, decls),
-                        Stmt::ActionStmt(_)
-                        | Stmt::Atomic { .. }
-                        | Stmt::Connect { .. }
-                        | Stmt::Import { .. }
-                        | Stmt::Test { .. }
-                        | Stmt::Watch { .. } => continue,
-                    };
+                let updated_members = updated_services
+                    .iter()
+                    .flat_map(|(svc, decls)| {
+                        decls.iter().filter_map(move |decl| match decl {
+                            Decl::VarDecl { name, .. } | Decl::DefDecl { name, .. } => {
+                                Some((**svc, *name))
+                            }
+                            Decl::TableDecl { .. } => None,
+                        })
+                    })
+                    .collect();
+                manager.mark_source_updates(updated_members);
+
+                for (svc_name, decls) in updated_services {
                     if manager.services.contains_key(svc_name) {
                         for decl in decls {
                             match decl {

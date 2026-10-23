@@ -10,6 +10,7 @@ use crate::net::{
 };
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::txn::{Transaction, TxnId, VClock, VarState, WaitKey};
+use petgraph::{graphmap::DiGraphMap, visit::Dfs};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
@@ -39,6 +40,9 @@ pub struct Service {
     /// #24: cached values of each def's cross-service deps:
     /// def -> {(source service, member) -> (value, clock)}.
     pub dep_cache: DepCache,
+    /// Defs that must notify listeners after their next successful recomputation
+    /// because a committed code update may have changed their Sources.
+    pending_source_updates: HashSet<Symbol>,
     /// Optional lock for whole-service blocking during structural updates
     pub service_lock: Option<TxnId>,
 }
@@ -485,6 +489,7 @@ impl Manager {
                 graphs: ServiceGraphs::new(),
                 listeners: HashMap::new(),
                 dep_cache: HashMap::new(),
+                pending_source_updates: HashSet::new(),
                 service_lock: None,
             },
         );
@@ -901,12 +906,56 @@ impl Manager {
         v_base
     }
 
+    /// Mark affected defs after all updated graphs are installed. A blocked def
+    /// keeps its notification until an input permits successful recomputation.
+    pub(crate) fn mark_source_updates(&mut self, members: Vec<(Symbol, Symbol)>) {
+        // This temporary graph joins existing dependency edges across services,
+        // including imported declarations. It is built only for code updates.
+        let mut dependents = DiGraphMap::<(Symbol, Symbol), ()>::new();
+        for (&svc, graphs) in self
+            .services
+            .iter()
+            .map(|(name, service)| (name, &service.graphs))
+            .chain(self.declaration_graphs.iter())
+        {
+            for &def in &graphs.defs {
+                dependents.add_node((svc, def));
+            }
+            for (input, def, _) in graphs.reactive_graph.all_edges() {
+                // A var's initializer does not create a reactive dependency.
+                if graphs.defs.contains(&def) {
+                    dependents.add_edge((svc, input), (svc, def), ());
+                }
+            }
+            for (&def, inputs) in &graphs.cross_deps {
+                if graphs.defs.contains(&def) {
+                    for &input in inputs {
+                        dependents.add_edge(input, (svc, def), ());
+                    }
+                }
+            }
+        }
+        // Share visited state across roots; cycles and shared upstreams need
+        // only one pending notification per affected def.
+        let mut dfs = Dfs::empty(&dependents);
+        for member in members {
+            dfs.move_to(member);
+            while let Some((svc, def)) = dfs.next(&dependents) {
+                if let Some(service) = self.services.get_mut(&svc) {
+                    if service.defs.contains_key(&def) {
+                        service.pending_source_updates.insert(def);
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) async fn propagate(&mut self, service_name: Symbol, changed_var: Symbol) {
         // #24: event-driven reactivity over the listener graph. A change to a
         // member notifies its listeners. For each listener we resolve its
         // service id to a local service: Some means a local listener, which we
         // recompute from current values (and cached cross-service deps) and, if
-        // it changes, push back onto the worklist to cascade; None means the
+        // it needs notification, push back onto the worklist; None means the
         // listener lives on another node, which we notify over the wire via
         // emit_update.
         let mut worklist: Vec<(Symbol, Symbol)> = vec![(service_name, changed_var)];
@@ -1009,15 +1058,10 @@ impl Manager {
         (v_target, gate_ok)
     }
 
-    /// #24: recompute `def` in `svc` from current values, seeding the reactive
-    /// cache with this def's cached cross-service deps so MemberAccess resolves
-    /// from cache instead of a (possibly remote) lookup. Returns whether the
-    /// stored value or its clock changed.
-    ///
-    /// Vector clock PR update: to make sure that recomputing defs is safe
-    /// we add a check against the vector clocks of the dependencies of the def.
-    /// specifically, we check that for all dependent variables v that def depends on,
-    /// v has the same clock value in every vector clock stored by all vs
+    /// Recompute from current values and cached cross-service inputs when the
+    /// Sources gate permits it. Return whether listeners need notification:
+    /// the stored pair changed, or a committed code update is still pending.
+    /// Gate rejection and evaluation failure preserve the pending notification.
     pub(crate) async fn recompute_def(&mut self, svc: Symbol, def: Symbol) -> bool {
         let expr = match self
             .services
@@ -1096,6 +1140,7 @@ impl Manager {
             };
             match self.services.get_mut(&svc) {
                 Some(service) => {
+                    let pending_source_update = service.pending_source_updates.remove(&def);
                     if let Some(var_state) = service.vars.get_mut(&def) {
                         // listeners gate on the clock, so a clock that moved
                         // under an unchanged value must still reach them
@@ -1103,7 +1148,7 @@ impl Manager {
                             var_state.value != value || var_state.vector_clock != v_target;
                         var_state.value = value;
                         var_state.vector_clock = v_target;
-                        differs
+                        differs || pending_source_update
                     } else {
                         let mut var_state = VarState::new(value);
                         var_state.vector_clock = v_target;
