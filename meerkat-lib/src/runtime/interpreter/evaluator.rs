@@ -314,6 +314,10 @@ pub async fn eval(
                 .and_then(|c| c.get(&(service_name, member_name)))
                 .cloned()
             {
+                // Cached reads must obey the same validity checks as lookup.
+                ctx.manager
+                    .ensure_service_visible(service_name, ctx.txn.as_deref().map(|t| &t.id))?;
+                ctx.manager.ensure_member_ready(service_name, member_name)?;
                 return Ok(v);
             }
             // The `Manager` determines whether the service is local or

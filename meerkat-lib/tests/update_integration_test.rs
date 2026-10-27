@@ -8,7 +8,7 @@
 use meerkat_lib::net::ast::NetValue;
 use meerkat_lib::net::{
     Address, ClockEntry, MeerkatMessage, NetworkActor, NetworkCommand, NetworkEvent, NetworkReply,
-    NodeType, ServiceNetId,
+    NodeType, ServiceNetId, UpdateOrder,
 };
 use meerkat_lib::runtime::{
     ast::{ActionStmt, Expr, Stmt, Value},
@@ -869,6 +869,7 @@ async fn subscribe(manager: &mut Manager, address: &Address) {
             ServiceNetId("observer".to_string()),
             sink,
             address.0.clone(),
+            1,
         )
         .await;
 }
@@ -902,6 +903,7 @@ async fn assert_update(
                 member,
                 value,
                 clock,
+                ..
             } => {
                 assert_eq!(listener_service, "observer");
                 assert_eq!(listener_def, "sink");
@@ -995,7 +997,7 @@ async fn test_update_waits_for_missing_input_without_publishing() {
         .get(&result)
         .is_some_and(|cache| cache.contains_key(&(remote, current))));
 
-    let (listener_service, listener_def, reply_to) = loop {
+    let (listener_service, listener_def, reply_to, subscription) = loop {
         match next_message(&mut peer).await {
             MeerkatMessage::Ping { .. } => continue,
             MeerkatMessage::RequestUpdates {
@@ -1004,11 +1006,11 @@ async fn test_update_waits_for_missing_input_without_publishing() {
                 listener_service,
                 listener_def,
                 reply_to,
-                ..
+                request_id,
             } => {
                 assert_eq!(service, "remote");
                 assert_eq!(member, "current");
-                break (listener_service, listener_def, reply_to);
+                break (listener_service, listener_def, reply_to, request_id);
             }
             other => panic!("expected subscription, got {other:?}"),
         }
@@ -1022,6 +1024,10 @@ async fn test_update_waits_for_missing_input_without_publishing() {
                 source_service: "remote".to_string(),
                 member: "current".to_string(),
                 value: NetValue::Int { val: 20 },
+                order: UpdateOrder {
+                    subscription,
+                    sequence: 1,
+                },
                 clock: vec![ClockEntry {
                     service: "remote".to_string(),
                     member: "input".to_string(),

@@ -92,6 +92,14 @@ pub struct ClockEntry {
     pub counter: u64,
 }
 
+/// Publication order within one RequestUpdates subscription. This orders
+/// snapshots even when their data clocks are equal, incomparable, or shrink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateOrder {
+    pub subscription: u64,
+    pub sequence: u64,
+}
+
 /// Message types in the `Meerkat` protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MeerkatMessage {
@@ -124,7 +132,13 @@ pub enum MeerkatMessage {
     },
 
     /// Response to a `LookupRequest` with the serialized value
-    LookupResponse { request_id: u64, value: NetValue },
+    LookupResponse {
+        request_id: u64,
+        value: NetValue,
+        /// Clock paired with value. None means an unstamped buffered write
+        /// or a reply from a peer that does not provide clocks.
+        clock: Option<Vec<ClockEntry>>,
+    },
 
     /// Response indicating lookup failed
     LookupError { request_id: u64, error: String },
@@ -213,6 +227,7 @@ pub enum MeerkatMessage {
         member: String,
         value: NetValue,
         clock: Vec<ClockEntry>,
+        order: UpdateOrder,
     },
 
     /// #39: request the source of a `.mkt` file by path. A (browser) client

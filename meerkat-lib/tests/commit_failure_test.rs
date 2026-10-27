@@ -13,7 +13,7 @@
 use meerkat_lib::net::ast::NetValue;
 use meerkat_lib::net::{
     Address, MeerkatMessage, NetworkActor, NetworkCommand, NetworkEvent, NetworkReply, NodeType,
-    ServiceNetId,
+    ServiceNetId, UpdateOrder,
 };
 use meerkat_lib::runtime::ast::{ActionStmt, Expr, Value};
 use meerkat_lib::runtime::manager::ParkedRequest;
@@ -105,10 +105,15 @@ async fn refuse_commits(net: &mut NetworkActor, reason: &str, got_commit: &Cell<
                     ..
                 } => {
                     let value = NetValue::Int { val: 1 };
-                    let msg = MeerkatMessage::LookupResponse { request_id, value };
+                    let msg = MeerkatMessage::LookupResponse {
+                        request_id,
+                        value,
+                        clock: Some(Vec::new()),
+                    };
                     reply(net, &reply_to, msg).await;
                 }
                 MeerkatMessage::RequestUpdates {
+                    request_id,
                     listener_service,
                     listener_def,
                     reply_to,
@@ -121,6 +126,10 @@ async fn refuse_commits(net: &mut NetworkActor, reason: &str, got_commit: &Cell<
                         member: "gc".to_string(),
                         value: NetValue::Int { val: 1 },
                         clock: Vec::new(),
+                        order: UpdateOrder {
+                            subscription: request_id,
+                            sequence: 1,
+                        },
                     };
                     reply(net, &reply_to, msg).await;
                 }
