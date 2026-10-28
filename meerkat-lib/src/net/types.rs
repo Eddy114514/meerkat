@@ -92,14 +92,6 @@ pub struct ClockEntry {
     pub counter: u64,
 }
 
-/// Publication order within one RequestUpdates subscription. This orders
-/// snapshots even when their data clocks are equal, incomparable, or shrink.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UpdateOrder {
-    pub subscription: u64,
-    pub sequence: u64,
-}
-
 /// Message types in the `Meerkat` protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MeerkatMessage {
@@ -227,7 +219,6 @@ pub enum MeerkatMessage {
         member: String,
         value: NetValue,
         clock: Vec<ClockEntry>,
-        order: UpdateOrder,
     },
 
     /// #39: request the source of a `.mkt` file by path. A (browser) client

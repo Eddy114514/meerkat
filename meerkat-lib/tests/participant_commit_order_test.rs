@@ -18,7 +18,6 @@
 //! pushes nothing on its own, so `mid` sees the new value only through that.
 
 use meerkat_lib::net::ast::NetValue;
-use meerkat_lib::net::UpdateOrder;
 use meerkat_lib::net::{
     Address, ClockEntry, MeerkatMessage, NetworkActor, NetworkCommand, NetworkEvent, NetworkReply,
     NodeType, ServiceNetId,
@@ -145,7 +144,6 @@ async fn serve_rc(rc_net: &mut NetworkActor) {
                     reply(rc_net, &reply_to, msg).await;
                 }
                 MeerkatMessage::RequestUpdates {
-                    request_id,
                     listener_service,
                     listener_def,
                     reply_to,
@@ -158,10 +156,6 @@ async fn serve_rc(rc_net: &mut NetworkActor) {
                         member: "gc".to_string(),
                         value,
                         clock,
-                        order: UpdateOrder {
-                            subscription: request_id,
-                            sequence: 1,
-                        },
                     };
                     reply(rc_net, &reply_to, msg).await;
                 }

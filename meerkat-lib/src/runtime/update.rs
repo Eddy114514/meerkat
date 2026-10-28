@@ -350,6 +350,15 @@ impl Transaction {
                 let updated_svc_names: HashSet<_> =
                     updated_services.iter().map(|(name, _)| **name).collect();
 
+                for updated_svc_name in updated_svc_names {
+                    if let Some(dep) = self.deps.remove(&updated_svc_name) {
+                        manager.update_service_graphs(updated_svc_name, dep).await;
+                        if let Some(service) = manager.services.get_mut(&updated_svc_name) {
+                            service.service_lock = None;
+                        }
+                    }
+                }
+
                 let updated_members = updated_services
                     .iter()
                     .flat_map(|(svc, decls)| {
@@ -361,19 +370,7 @@ impl Transaction {
                         })
                     })
                     .collect();
-                // Establish invalidity before graph installation can await
-                // network subscription work. Traverse the committed new graphs,
-                // including edges not yet installed on running services.
-                manager.mark_source_updates(updated_members, &self.deps);
-
-                for updated_svc_name in updated_svc_names {
-                    if let Some(dep) = self.deps.remove(&updated_svc_name) {
-                        manager.update_service_graphs(updated_svc_name, dep).await;
-                        if let Some(service) = manager.services.get_mut(&updated_svc_name) {
-                            service.service_lock = None;
-                        }
-                    }
-                }
+                manager.mark_source_updates(updated_members);
 
                 for (svc_name, decls) in updated_services {
                     if manager.services.contains_key(svc_name) {
@@ -389,10 +386,6 @@ impl Transaction {
                                 } => {
                                     if manager.recompute_def(*svc_name, *decl_name).await {
                                         manager.propagate(*svc_name, *decl_name).await;
-                                    } else {
-                                        // A blocked root can still have ready
-                                        // users, e.g. an unselected branch.
-                                        manager.retry_pending_definitions().await;
                                     }
                                 }
                                 Decl::TableDecl { .. } => {}

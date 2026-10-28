@@ -967,7 +967,6 @@ async fn run_server(
                     .await;
                 }
                 MeerkatMessage::RequestUpdates {
-                    request_id,
                     service,
                     member,
                     listener_service,
@@ -994,7 +993,6 @@ async fn run_server(
                             ServiceNetId(listener_service),
                             listener_def_sym,
                             reply_to,
-                            request_id,
                         )
                         .await;
                 }
@@ -1005,7 +1003,6 @@ async fn run_server(
                     member,
                     value,
                     clock,
-                    order,
                 } => {
                     // #24: validate + intern wire names through codec; skip on bad input.
                     // Vector-clock PR: the clock's dimension names are interned here
@@ -1029,7 +1026,6 @@ async fn run_server(
                             member_sym,
                             value,
                             vclock,
-                            order,
                         )
                         .await;
                 }
@@ -1218,10 +1214,11 @@ async fn run_client(
                 member,
                 value,
                 clock,
-                order,
             }) = msg
             {
-                let parsed = codec::decode_value(value.clone(), &mut manager.interner);
+                if let Ok(parsed) = codec::decode_value(value.clone(), &mut manager.interner) {
+                    println!("[update] {}.{} = {:?}", source_service, member, parsed);
+                }
                 let lid = ServiceNetId(listener_service);
                 // #24: validate + intern wire names through codec; skip on bad input.
                 // Vector-clock PR: the clock's dimension names are interned here
@@ -1236,23 +1233,9 @@ async fn run_client(
                     Ok(syms) => syms,
                     Err(_) => continue,
                 };
-                if !manager
-                    .handle_update(
-                        lid.clone(),
-                        def_sym,
-                        source_sym,
-                        member_sym,
-                        value,
-                        vclock,
-                        order,
-                    )
-                    .await
-                {
-                    continue;
-                }
-                if let Ok(parsed) = parsed {
-                    println!("[update] {}.{} = {:?}", source_service, member, parsed);
-                }
+                manager
+                    .handle_update(lid.clone(), def_sym, source_sym, member_sym, value, vclock)
+                    .await;
                 if let Some((_, svc)) = manager.services.iter().find(|(_, s)| s.id == lid) {
                     if let Some(vs) = svc.vars.get(&def_sym) {
                         println!("          -> {} = {:?}", listener_def, vs.value);
