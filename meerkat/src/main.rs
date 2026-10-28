@@ -388,11 +388,14 @@ async fn dispatch_parked(manager: &mut Manager, parked: ParkedRequest) {
                         },
                     );
                 }
-                Ok(val) => {
+                Ok((val, clock)) => {
                     let response = match codec::encode_value(&val, &manager.interner) {
                         Ok(enc_val) => MeerkatMessage::LookupResponse {
                             request_id,
                             value: enc_val,
+                            clock: clock
+                                .as_ref()
+                                .map(|clock| codec::encode_clock(clock, &manager.interner)),
                         },
                         Err(e) => MeerkatMessage::LookupError {
                             request_id,
@@ -776,12 +779,13 @@ async fn run_server(
                         }
                         // Plain unlocked read: reply immediately
                         None => {
-                            let result = manager.lookup(mem_sym, svc_sym, None).await;
+                            let result = manager.lookup_with_clock(mem_sym, svc_sym, None).await;
                             let response = match result {
-                                Ok(val) => match codec::encode_value(&val, &manager.interner) {
+                                Ok((val, clock)) => match codec::encode_value(&val, &manager.interner) {
                                     Ok(enc_val) => MeerkatMessage::LookupResponse {
                                         request_id,
                                         value: enc_val,
+                                        clock: clock.as_ref().map(|clock| codec::encode_clock(clock, &manager.interner)),
                                     },
                                     Err(e) => MeerkatMessage::LookupError {
                                         request_id,

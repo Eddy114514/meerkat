@@ -120,6 +120,15 @@ async fn serve_rc(rc_net: &mut NetworkActor) {
         let value = NetValue::Int {
             val: if committed { 11 } else { 1 },
         };
+        let clock = if committed {
+            vec![ClockEntry {
+                service: "rc".to_string(),
+                member: "cv".to_string(),
+                counter: 1,
+            }]
+        } else {
+            Vec::new()
+        };
         match rc_net.event_rx.try_recv() {
             Ok(NetworkEvent::MessageReceived { msg, .. }) => match msg {
                 MeerkatMessage::LookupRequest {
@@ -127,7 +136,11 @@ async fn serve_rc(rc_net: &mut NetworkActor) {
                     reply_to,
                     ..
                 } => {
-                    let msg = MeerkatMessage::LookupResponse { request_id, value };
+                    let msg = MeerkatMessage::LookupResponse {
+                        request_id,
+                        value,
+                        clock: Some(clock),
+                    };
                     reply(rc_net, &reply_to, msg).await;
                 }
                 MeerkatMessage::RequestUpdates {
@@ -142,15 +155,7 @@ async fn serve_rc(rc_net: &mut NetworkActor) {
                         source_service: "rc".to_string(),
                         member: "gc".to_string(),
                         value,
-                        clock: if committed {
-                            vec![ClockEntry {
-                                service: "rc".to_string(),
-                                member: "cv".to_string(),
-                                counter: 1,
-                            }]
-                        } else {
-                            Vec::new()
-                        },
+                        clock,
                     };
                     reply(rc_net, &reply_to, msg).await;
                 }

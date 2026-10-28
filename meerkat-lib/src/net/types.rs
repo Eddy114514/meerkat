@@ -124,7 +124,13 @@ pub enum MeerkatMessage {
     },
 
     /// Response to a `LookupRequest` with the serialized value
-    LookupResponse { request_id: u64, value: NetValue },
+    LookupResponse {
+        request_id: u64,
+        value: NetValue,
+        /// Clock paired with value. None means an unstamped buffered write
+        /// or a reply from a peer that does not provide clocks.
+        clock: Option<Vec<ClockEntry>>,
+    },
 
     /// Response indicating lookup failed
     LookupError { request_id: u64, error: String },

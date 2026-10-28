@@ -105,7 +105,11 @@ async fn refuse_commits(net: &mut NetworkActor, reason: &str, got_commit: &Cell<
                     ..
                 } => {
                     let value = NetValue::Int { val: 1 };
-                    let msg = MeerkatMessage::LookupResponse { request_id, value };
+                    let msg = MeerkatMessage::LookupResponse {
+                        request_id,
+                        value,
+                        clock: Some(Vec::new()),
+                    };
                     reply(net, &reply_to, msg).await;
                 }
                 MeerkatMessage::RequestUpdates {
