@@ -17,7 +17,7 @@ use crate::runtime::limits::{
     MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH,
 };
 use crate::runtime::tt::{Param, ServiceType, TupleType, Type};
-use crate::runtime::txn::VClock;
+use crate::runtime::txn::{Sources, VClock};
 use std::collections::HashMap;
 
 fn validate_identifier(s: &str) -> Result<()> {
@@ -301,20 +301,32 @@ pub fn clock_entry_to_vclock(clock: Vec<ClockEntry>, interner: &mut Interner) ->
     Ok(vclock)
 }
 
+/// Decode the source identities paired with a network value.
+pub fn decode_sources(sources: Vec<(String, String)>, interner: &mut Interner) -> Result<Sources> {
+    sources
+        .into_iter()
+        .map(|(service, member)| {
+            validate_identifier(&service)?;
+            validate_identifier(&member)?;
+            Ok((interner.insert(&service), interner.insert(&member)))
+        })
+        .collect()
+}
+
 /// #24: validate and intern the identifier fields of an `Update` message
 /// arriving over the wire (the `value` is decoded separately via
 /// `decode_value`). As with `decode_request_updates`, all interning of
 /// network-sourced names happens here after validation.
 ///
-/// Returns `(listener_def, source_service, member, vector clock)`. The first three arguments
-/// are returned as interned symbols, while the last is returned as an interned VClock.
+/// Returns the interned identifiers, vector clock and paired source identities.
 pub fn decode_update(
     listener_def: &str,
     source_service: &str,
     member: &str,
     interner: &mut Interner,
     clock: Vec<ClockEntry>,
-) -> Result<(Symbol, Symbol, Symbol, VClock)> {
+    sources: Option<Vec<(String, String)>>,
+) -> Result<(Symbol, Symbol, Symbol, VClock, Option<Sources>)> {
     validate_identifier(listener_def)?;
     validate_identifier(source_service)?;
     validate_identifier(member)?;
@@ -323,6 +335,9 @@ pub fn decode_update(
         interner.insert(source_service),
         interner.insert(member),
         clock_entry_to_vclock(clock, interner)?,
+        sources
+            .map(|sources| decode_sources(sources, interner))
+            .transpose()?,
     ))
 }
 
@@ -659,6 +674,19 @@ pub fn encode_clock(clock: &VClock, interner: &Interner) -> Vec<ClockEntry> {
             service: interner.get(*svc_sym).to_string(),
             member: interner.get(*var_sym).to_string(),
             counter: *i,
+        })
+        .collect()
+}
+
+/// Encode the source identities paired with a runtime value.
+pub fn encode_sources(sources: &Sources, interner: &Interner) -> Vec<(String, String)> {
+    sources
+        .iter()
+        .map(|(service, member)| {
+            (
+                interner.get(*service).to_string(),
+                interner.get(*member).to_string(),
+            )
         })
         .collect()
 }
@@ -1764,7 +1792,7 @@ mod tests {
                 "decode_request_updates should reject service {:?}",
                 bad
             );
-            let res = decode_update("ldef", bad, "member", &mut interner, vec![]);
+            let res = decode_update("ldef", bad, "member", &mut interner, vec![], None);
             assert!(
                 res.is_err(),
                 "decode_update should reject source_service {:?}",
@@ -1773,7 +1801,7 @@ mod tests {
         }
         // A well-formed identifier is accepted.
         assert!(decode_request_updates("svc", "y", "z", &mut interner).is_ok());
-        assert!(decode_update("z", "svc", "y", &mut interner, vec![]).is_ok());
+        assert!(decode_update("z", "svc", "y", &mut interner, vec![], None).is_ok());
     }
 
     /// Vector-clock PR: a clock survives an encode/decode round-trip through the
@@ -1805,7 +1833,7 @@ mod tests {
             member: "x".to_string(),
             counter: 1,
         }];
-        let res = decode_update("ldef", "svc", "member", &mut interner, bad);
+        let res = decode_update("ldef", "svc", "member", &mut interner, bad, None);
         assert!(
             res.is_err(),
             "decode_update should reject a clock with a non-identifier dimension"

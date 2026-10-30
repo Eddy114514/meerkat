@@ -130,6 +130,7 @@ pub enum MeerkatMessage {
         /// Clock paired with value. None means an unstamped buffered write
         /// or a reply from a peer that does not provide clocks.
         clock: Option<Vec<ClockEntry>>,
+        sources: Option<Vec<(String, String)>>,
     },
 
     /// Response indicating lookup failed
@@ -219,6 +220,7 @@ pub enum MeerkatMessage {
         member: String,
         value: NetValue,
         clock: Vec<ClockEntry>,
+        sources: Option<Vec<(String, String)>>,
     },
 
     /// #39: request the source of a `.mkt` file by path. A (browser) client

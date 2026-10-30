@@ -902,6 +902,7 @@ async fn assert_update(
                 member,
                 value,
                 clock,
+                ..
             } => {
                 assert_eq!(listener_service, "observer");
                 assert_eq!(listener_def, "sink");
@@ -993,7 +994,8 @@ async fn test_update_waits_for_missing_input_without_publishing() {
     assert!(!manager.services[&local]
         .dep_cache
         .get(&result)
-        .is_some_and(|cache| cache.contains_key(&(remote, current))));
+        .and_then(|cache| cache.get(&(remote, current)))
+        .is_some_and(|entry| entry.1.is_some()));
 
     let (listener_service, listener_def, reply_to) = loop {
         match next_message(&mut peer).await {
@@ -1027,6 +1029,7 @@ async fn test_update_waits_for_missing_input_without_publishing() {
                     member: "input".to_string(),
                     counter: 1,
                 }],
+                sources: Some(vec![("remote".into(), "input".into())]),
             },
         })
         .await;
@@ -1035,7 +1038,8 @@ async fn test_update_waits_for_missing_input_without_publishing() {
         while !manager.services[&local]
             .dep_cache
             .get(&result)
-            .is_some_and(|cache| cache.contains_key(&(remote, current)))
+            .and_then(|cache| cache.get(&(remote, current)))
+            .is_some_and(|entry| entry.1.is_some())
         {
             manager.dispatch_network_events().await;
             tokio::task::yield_now().await;
@@ -1047,7 +1051,11 @@ async fn test_update_waits_for_missing_input_without_publishing() {
     let clock = HashMap::from([((remote, input), 1)]);
     assert_eq!(
         manager.services[&local].dep_cache[&result][&(remote, current)],
-        (Value::Int { val: 20 }, clock.clone())
+        (
+            Value::Int { val: 20 },
+            Some(clock.clone()),
+            Some(std::collections::HashSet::from([(remote, input)]))
+        )
     );
     assert_eq!(
         manager.services[&local].vars[&result].value,

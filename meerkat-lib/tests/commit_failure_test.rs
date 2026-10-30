@@ -109,6 +109,7 @@ async fn refuse_commits(net: &mut NetworkActor, reason: &str, got_commit: &Cell<
                         request_id,
                         value,
                         clock: Some(Vec::new()),
+                        sources: Some(vec![("rc".into(), "cv".into())]),
                     };
                     reply(net, &reply_to, msg).await;
                 }
@@ -125,6 +126,7 @@ async fn refuse_commits(net: &mut NetworkActor, reason: &str, got_commit: &Cell<
                         member: "gc".to_string(),
                         value: NetValue::Int { val: 1 },
                         clock: Vec::new(),
+                        sources: Some(vec![("rc".into(), "cv".into())]),
                     };
                     reply(net, &reply_to, msg).await;
                 }
@@ -167,7 +169,8 @@ async fn await_gc_update(m: &mut Manager, rc_net: &mut NetworkActor) {
     let [mid, mid_view, rc, gc] = ["mid", "mid_view", "rc", "gc"].map(|n| m.interner.insert(n));
     let cached = |m: &Manager| {
         let deps = m.services[&mid].dep_cache.get(&mid_view);
-        deps.is_some_and(|deps| deps.contains_key(&(rc, gc)))
+        deps.and_then(|deps| deps.get(&(rc, gc)))
+            .is_some_and(|entry| entry.1.is_some())
     };
     let pump = async {
         while !cached(m) {
