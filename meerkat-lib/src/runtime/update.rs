@@ -8,7 +8,10 @@
 use crate::net::LockGroup;
 use crate::runtime::ast::{apply_updates_to_ast, Decl, Expr, Stmt, Value};
 use crate::runtime::env::Env;
-use crate::runtime::graphs::{analysis::compute_dependencies, ServiceGraphs};
+use crate::runtime::graphs::{
+    analysis::{declaration_graphs, service_declarations},
+    ServiceGraphs,
+};
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::interpreter::evaluator::{eval, EvalContext, EvalError};
 use crate::runtime::manager::Manager;
@@ -182,7 +185,7 @@ impl Transaction {
 
                 self.lock_txn = Some(txn);
                 self.state = TransactionState::LocksAcquired;
-                match apply_updates_to_ast(&manager.unified_ast, &self.updates) {
+                match apply_updates_to_ast(manager.unified_ast(), &self.updates) {
                     Ok(patched) => self.ast = patched,
                     Err(sym) => {
                         self.release_lock_txn(manager);
@@ -249,44 +252,6 @@ impl Transaction {
                         msg
                     )));
                 }
-                let mut pre_initialized = HashMap::new();
-                for (svc_name, svc_state) in &manager.services {
-                    let members: HashSet<Symbol> = svc_state
-                        .vars
-                        .keys()
-                        .chain(svc_state.defs.keys())
-                        .copied()
-                        .collect();
-                    pre_initialized.insert(*svc_name, members);
-                }
-
-                let service_graphs_vec = compute_dependencies(&self.ast, Some(&pre_initialized));
-
-                let service_stmts: Vec<Symbol> = self
-                    .ast
-                    .iter()
-                    .filter_map(|stmt| match stmt {
-                        Stmt::Service { name, .. } => Some(*name),
-                        Stmt::ActionStmt(_)
-                        | Stmt::Atomic { .. }
-                        | Stmt::Update { .. }
-                        | Stmt::Connect { .. }
-                        | Stmt::Import { .. }
-                        | Stmt::Test { .. }
-                        | Stmt::Watch { .. } => None,
-                    })
-                    .collect();
-
-                debug_assert_eq!(
-                    service_stmts.len(),
-                    service_graphs_vec.len(),
-                    "Service statement count must match graph count"
-                );
-
-                for (name, graphs) in service_stmts.into_iter().zip(service_graphs_vec) {
-                    self.deps.insert(name, graphs);
-                }
-
                 for stmt in &self.updates {
                     let (svc_name, decls) = match stmt {
                         Stmt::Service { name, decls } => (name, decls),
@@ -331,6 +296,17 @@ impl Transaction {
                         self.values.insert((*svc_name, var_name), val);
                     }
                 }
+
+                // Evaluation can dispatch other code updates. Include declarations
+                // this full AST install restores, so retained graphs still match it.
+                let installed = service_declarations(manager.unified_ast());
+                let mut targets = HashSet::new();
+                update_targets(&self.updates, &mut targets);
+                self.deps = declaration_graphs(&self.ast, |name, stmt| {
+                    targets.contains(&name)
+                        || (!manager.services.contains_key(&name)
+                            && installed.get(&name).copied() != Some(stmt))
+                });
 
                 self.state = TransactionState::Evaluated;
                 self.commit(manager);
@@ -445,7 +421,6 @@ impl Transaction {
     ///     `manager` (`&mut Manager`): The active runtime manager
     fn commit(&mut self, manager: &mut Manager) {
         debug_assert_eq!(self.state, TransactionState::Evaluated);
-        manager.install_analyzed_ast(std::mem::take(&mut self.ast), &mut self.deps);
         manager.local_services = std::mem::replace(&mut self.types, Env::new(None));
 
         for ((svc_name, var_name), val) in std::mem::take(&mut self.values) {
@@ -469,7 +444,7 @@ impl Transaction {
             }
         }
 
-        for stmt in &manager.unified_ast {
+        for stmt in &self.ast {
             if let Stmt::Service { name, decls } = stmt {
                 if let Some(service) = manager.services.get_mut(name) {
                     for decl in decls {
@@ -484,6 +459,28 @@ impl Transaction {
                     }
                 }
             }
+        }
+        manager.install_analyzed_ast(std::mem::take(&mut self.ast), &mut self.deps);
+    }
+}
+
+/// Services whose declarations `updates` replace, including inside `atomic`
+/// blocks, as `apply_updates_to_ast` applies them.
+fn update_targets(updates: &[Stmt], targets: &mut HashSet<Symbol>) {
+    for stmt in updates {
+        match stmt {
+            Stmt::Service { name, .. }
+            | Stmt::Update {
+                service_name: name, ..
+            } => {
+                targets.insert(*name);
+            }
+            Stmt::Atomic { updates } => update_targets(updates, targets),
+            Stmt::ActionStmt(_)
+            | Stmt::Connect { .. }
+            | Stmt::Import { .. }
+            | Stmt::Test { .. }
+            | Stmt::Watch { .. } => {}
         }
     }
 }
