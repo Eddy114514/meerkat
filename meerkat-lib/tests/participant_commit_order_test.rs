@@ -26,7 +26,7 @@ use meerkat_lib::runtime::ast::{ActionStmt, Expr, Value};
 use meerkat_lib::runtime::parser::parse_string;
 use meerkat_lib::runtime::txn::{Transaction, TxnId};
 use meerkat_lib::runtime::{Interner, Manager, Node};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Bring a `NetworkActor` up on an ephemeral loopback port and return it with
 /// its dialable address.
@@ -81,6 +81,7 @@ async fn middle_node(net: NetworkActor, rc_net: &mut NetworkActor, rc_addr: &Add
     let mid = m.interner.insert("mid");
     let mid_view = m.interner.insert("mid_view");
     let gc = m.interner.insert("gc");
+    let cv = m.interner.insert("cv");
     let mid_id = m.services[&mid].id.clone();
     m.subscribe_remote(rc, gc, mid_id, mid_view).await;
     tokio::select! {
@@ -95,7 +96,11 @@ async fn middle_node(net: NetworkActor, rc_net: &mut NetworkActor, rc_addr: &Add
     );
     assert_eq!(
         m.services[&mid].dep_cache[&mid_view][&(rc, gc)],
-        (Value::Int { val: 1 }, HashMap::new()),
+        (
+            Value::Int { val: 1 },
+            Some(HashMap::new()),
+            Some(HashSet::from([(rc, cv)]))
+        ),
         "the initial subscription carries gc's initial value and zero clock"
     );
     m
@@ -140,6 +145,7 @@ async fn serve_rc(rc_net: &mut NetworkActor) {
                         request_id,
                         value,
                         clock: Some(clock),
+                        sources: Some(vec![("rc".into(), "cv".into())]),
                     };
                     reply(rc_net, &reply_to, msg).await;
                 }
@@ -156,6 +162,7 @@ async fn serve_rc(rc_net: &mut NetworkActor) {
                         member: "gc".to_string(),
                         value,
                         clock,
+                        sources: Some(vec![("rc".into(), "cv".into())]),
                     };
                     reply(rc_net, &reply_to, msg).await;
                 }
@@ -197,7 +204,8 @@ async fn await_gc_update(m: &mut Manager) {
     let [mid, mid_view, rc, gc] = ["mid", "mid_view", "rc", "gc"].map(|n| m.interner.insert(n));
     let cached = |m: &Manager| {
         let deps = m.services[&mid].dep_cache.get(&mid_view);
-        deps.is_some_and(|deps| deps.contains_key(&(rc, gc)))
+        deps.and_then(|deps| deps.get(&(rc, gc)))
+            .is_some_and(|entry| entry.1.is_some())
     };
     let pump = async {
         while !cached(m) {
@@ -229,7 +237,11 @@ fn assert_committed_and_recomputed(m: &mut Manager) {
     );
     assert_eq!(
         m.services[&mid].dep_cache[&mid_view][&(rc, gc)],
-        (Value::Int { val: 11 }, HashMap::from([((rc, cv), 1)])),
+        (
+            Value::Int { val: 11 },
+            Some(HashMap::from([((rc, cv), 1)])),
+            Some(HashSet::from([(rc, cv)]))
+        ),
         "the refreshed cache preserves rc.gc's committed value and source clock"
     );
     assert_eq!(
@@ -305,13 +317,21 @@ async fn test_propagation_does_not_use_cached_participant_values() {
     let mid_view = m.interner.insert("mid_view");
     let rc = m.interner.insert("rc");
     let gc = m.interner.insert("gc");
+    let cv = m.interner.insert("cv");
     m.services
         .get_mut(&mid)
         .unwrap()
         .dep_cache
         .entry(mid_view)
         .or_default()
-        .insert((rc, gc), (Value::Int { val: 1 }, HashMap::new()));
+        .insert(
+            (rc, gc),
+            (
+                Value::Int { val: 1 },
+                Some(HashMap::new()),
+                Some(HashSet::from([(rc, cv)])),
+            ),
+        );
 
     commit_as_participant(&mut m, &mut rc_net, &rc_addr).await;
     assert_committed_and_recomputed(&mut m);

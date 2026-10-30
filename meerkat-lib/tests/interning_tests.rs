@@ -47,7 +47,7 @@ fn test_transaction_maps_indexing() {
     assert!(txn.locked.contains(&key));
 
     let read_value = meerkat_lib::runtime::ast::Value::Int { val: 42 };
-    let read_entry = (read_value, Some(HashMap::new()));
+    let read_entry = (read_value, Some(HashMap::new()), None);
     txn.read_cache.insert(key.clone(), read_entry.clone());
     assert_eq!(txn.read_cache.get(&key), Some(&read_entry));
 

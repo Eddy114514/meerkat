@@ -212,9 +212,10 @@ impl VarLock {
     }
 }
 pub type VClock = HashMap<(Symbol, Symbol), u64>;
+pub type Sources = HashSet<(Symbol, Symbol)>;
 
 /// A read value and its committed clock. Buffered writes have no clock yet.
-pub type ReadEntry = (Value, Option<VClock>);
+pub type ReadEntry = (Value, Option<VClock>, Option<Sources>);
 
 /// Composite state for a single variable represented by `VarState`
 ///
@@ -233,6 +234,8 @@ pub struct VarState {
     // we shouldn't need to deal with any complicated removal semantics since the clock
     // should be monotonically increasing?
     pub vector_clock: VClock,
+    /// Sources paired with this value and clock; None means not yet known.
+    pub sources: Option<Sources>,
 }
 
 impl VarState {
@@ -243,6 +246,7 @@ impl VarState {
             lock: VarLock::new(),
             latest_write_txn: None,
             vector_clock: HashMap::new(),
+            sources: None,
         }
     }
 }

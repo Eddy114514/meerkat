@@ -384,8 +384,10 @@ impl Transaction {
                                 Decl::DefDecl {
                                     name: decl_name, ..
                                 } => {
-                                    if manager.recompute_def(*svc_name, *decl_name).await {
-                                        manager.propagate(*svc_name, *decl_name).await;
+                                    for (svc, member) in
+                                        manager.recompute_def(*svc_name, *decl_name).await
+                                    {
+                                        manager.propagate(svc, member).await;
                                     }
                                 }
                                 Decl::TableDecl { .. } => {}
@@ -450,6 +452,7 @@ impl Transaction {
             if let Some(service) = manager.services.get_mut(&svc_name) {
                 if let Some(var_state) = service.vars.get_mut(&var_name) {
                     var_state.value = val;
+                    var_state.sources = Some(HashSet::from([(svc_name, var_name)]));
                     var_state.lock = VarLock::Unlocked;
                 } else {
                     service.vars.insert(
@@ -459,6 +462,7 @@ impl Transaction {
                             lock: VarLock::Unlocked,
                             latest_write_txn: None,
                             vector_clock: HashMap::new(),
+                            sources: Some(HashSet::from([(svc_name, var_name)])),
                         },
                     );
                 }
