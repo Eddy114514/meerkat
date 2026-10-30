@@ -1,6 +1,6 @@
 use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
 use super::env::Env;
-use super::graphs::{analysis::compute_dependencies, free_var::cross_service_deps, ServiceGraphs};
+use super::graphs::{analysis::declaration_graphs, free_var::cross_service_deps, ServiceGraphs};
 use super::interpreter::{eval, execute_seq, EvalContext, EvalError, WAIT_DIE_DISPLAY_PREFIX};
 use super::tt::types::ServiceType;
 use crate::net::network_layer::NetworkLayer;
@@ -140,7 +140,7 @@ pub struct Manager {
     /// ServiceNetId, so the owner can route Updates back to it.
     pub listener_addrs: HashMap<ServiceNetId, String>,
     /// Installed declarations and imports, excluding executable program statements
-    pub unified_ast: Vec<Stmt>,
+    unified_ast: Vec<Stmt>,
     /// Graphs for installed declarations without a local service instance
     declaration_graphs: HashMap<Symbol, ServiceGraphs>,
     /// Global local services type environment
@@ -158,6 +158,18 @@ pub fn local_service_names(prog: &[Stmt]) -> HashSet<Symbol> {
             _ => None,
         })
         .collect()
+}
+
+/// Pointwise max of `clocks`; a dimension a clock omits counts as zero.
+fn join_clocks<'a>(clocks: impl IntoIterator<Item = &'a VClock>) -> VClock {
+    let mut joined = VClock::new();
+    for clock in clocks {
+        for (&dim, &counter) in clock {
+            let entry = joined.entry(dim).or_insert(0);
+            *entry = (*entry).max(counter);
+        }
+    }
+    joined
 }
 
 impl Manager {
@@ -185,22 +197,13 @@ impl Manager {
     /// Install initial or imported declarations and retain their analyzed graphs.
     /// Running services keep their graphs; code updates install those separately.
     pub fn install_unified_ast(&mut self, ast: Vec<Stmt>) {
-        let mut graphs = HashMap::new();
-        for stmt in &ast {
-            if let Stmt::Service { name, .. } = stmt {
-                if !self.services.contains_key(name) {
-                    if let Some(graph) =
-                        compute_dependencies(std::slice::from_ref(stmt), None).pop()
-                    {
-                        graphs.insert(*name, graph);
-                    }
-                }
-            }
-        }
+        let mut graphs = declaration_graphs(&ast, |name, _| !self.services.contains_key(&name));
+        self.declaration_graphs.clear();
         self.install_analyzed_ast(ast, &mut graphs);
     }
 
     /// Install committed declarations, moving only graphs without local instances.
+    /// Graphs of declarations left unchanged stay installed.
     /// Leave local candidates for update_service_graphs and listener installation.
     pub(crate) fn install_analyzed_ast(
         &mut self,
@@ -215,16 +218,20 @@ impl Manager {
                 Stmt::Service { .. } | Stmt::Import { .. } | Stmt::Connect { .. }
             )
         });
-        self.declaration_graphs = ast
-            .iter()
-            .filter_map(|stmt| match stmt {
+        self.declaration_graphs
+            .extend(ast.iter().filter_map(|stmt| match stmt {
                 Stmt::Service { name, .. } if !self.services.contains_key(name) => {
                     graphs.remove(name).map(|graph| (*name, graph))
                 }
                 _ => None,
-            })
-            .collect();
+            }));
         self.unified_ast = ast;
+    }
+
+    /// Installed declarations and imports. Change them through
+    /// `install_unified_ast` or a code update, which maintain their graphs.
+    pub fn unified_ast(&self) -> &[Stmt] {
+        &self.unified_ast
     }
 
     /// Park a request on the wait queue for the contended `WaitKey`
@@ -465,13 +472,13 @@ impl Manager {
             });
         }
 
-        let graphs = self.declaration_graphs.remove(&name).unwrap_or_else(|| {
-            self.unified_ast
-                .iter()
-                .find(|stmt| matches!(stmt, Stmt::Service { name: existing, .. } if *existing == name))
-                .and_then(|decl| compute_dependencies(std::slice::from_ref(decl), None).pop())
-                .unwrap_or_default()
-        });
+        let graphs = self
+            .declaration_graphs
+            .remove(&name)
+            .or_else(|| {
+                declaration_graphs(&self.unified_ast, |service, _| service == name).remove(&name)
+            })
+            .unwrap_or_default();
 
         // Earlier services may already depend on this not-yet-created owner.
         // Reuse initialization's deferred publication to complete those inputs.
@@ -1074,7 +1081,7 @@ impl Manager {
         &mut self,
         read_set: &HashSet<(Symbol, Symbol)>,
         write_set: &HashSet<(Symbol, Symbol)>,
-    ) -> VClock {
+    ) {
         let mut vclocks: Vec<&VClock> = Vec::new();
         // get all the vclocks first
         for (svc, var) in read_set.union(write_set) {
@@ -1090,13 +1097,7 @@ impl Manager {
             }
         }
         // compute the max over all vclocks
-        let mut v_base: VClock = HashMap::new();
-        for clk in &vclocks {
-            for (dim, &c) in *clk {
-                let e = v_base.entry(*dim).or_insert(0);
-                *e = (*e).max(c);
-            }
-        }
+        let mut v_base = join_clocks(vclocks);
         // increment if they're in the write_set
         for (svc, var) in write_set {
             *v_base.entry((*svc, *var)).or_insert(0) += 1;
@@ -1106,7 +1107,6 @@ impl Manager {
                 vs.vector_clock = v_base.clone(); // write the new base vector clock back to everything in the write set
             }
         }
-        v_base
     }
 
     /// Mark affected defs after all updated graphs are installed. A blocked def
@@ -1257,13 +1257,7 @@ impl Manager {
         &self,
         inputs: &[(&VClock, Option<Cow<'_, Sources>>)],
     ) -> (VClock, bool, Option<Sources>) {
-        let mut v_target = VClock::new();
-        for (clock, _) in inputs {
-            for (&dim, &counter) in *clock {
-                let entry = v_target.entry(dim).or_insert(0);
-                *entry = (*entry).max(counter);
-            }
-        }
+        let v_target = join_clocks(inputs.iter().map(|(clock, _)| *clock));
         let gate_ok = inputs.iter().all(|(clock, sources)| {
             v_target.iter().all(|(dim, &target)| {
                 sources
@@ -2921,8 +2915,7 @@ impl Manager {
             .keys()
             .filter_map(|(sid, var)| self.service_name_for_net_id(sid).map(|n| (n, *var)))
             .collect();
-        // for now, we don't need the resulting v_base, but we will in the future
-        self.simultaneous_bump(&read_set, &write_set); // returns V_new; discarded in M1
+        self.simultaneous_bump(&read_set, &write_set);
         let error = self.commit_participants(txn).await;
         for (listener, def, owner, member) in self.forget_participant_deps(txn) {
             self.subscribe_remote(owner, member, listener, def).await;
@@ -3993,7 +3986,7 @@ mod tests {
         let dep = service_stmt(&mut manager.interner, "dep", 7);
         let app = service_stmt(&mut manager.interner, "app", 1);
         let prog = vec![app.clone()];
-        manager.unified_ast = vec![dep, app];
+        manager.install_unified_ast(vec![dep, app]);
 
         manager
             .register_and_instantiate_imports(&prog, &HashMap::new())
@@ -4024,7 +4017,7 @@ mod tests {
         let dep = service_stmt(&mut manager.interner, "dep", 7);
         let app = service_stmt(&mut manager.interner, "app", 1);
         let prog = vec![app.clone()];
-        manager.unified_ast = vec![dep, app];
+        manager.install_unified_ast(vec![dep, app]);
         let mut urls = HashMap::new();
         urls.insert("far".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
 
@@ -4051,7 +4044,7 @@ mod tests {
         let dep = service_stmt(&mut manager.interner, "dep", 7);
         let app = service_stmt(&mut manager.interner, "app", 1);
         let prog = vec![app.clone()];
-        manager.unified_ast = vec![dep, app];
+        manager.install_unified_ast(vec![dep, app]);
         let mut urls = HashMap::new();
         urls.insert("dep".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
 

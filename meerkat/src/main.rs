@@ -556,7 +556,7 @@ async fn init_server_services(
 fn advertised_services(manager: &Manager) -> Vec<Symbol> {
     let mut seen = HashSet::new();
     manager
-        .unified_ast
+        .unified_ast()
         .iter()
         .filter_map(|stmt| match stmt {
             Stmt::Service { name, .. } => Some(*name),

@@ -786,7 +786,7 @@ async fn test_integration_create_service_rollback_cleans_ast() {
     assert!(create_result.is_err(), "Service creation should fail");
 
     assert!(
-        !manager.unified_ast.iter().any(|s| {
+        !manager.unified_ast().iter().any(|s| {
             if let meerkat_lib::runtime::ast::Stmt::Service { name, .. } = s {
                 *name == bad_s_sym
             } else {
